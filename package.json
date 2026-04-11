@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@rohitaryal/whisk-api": "^4.0.0"
+  }
+}

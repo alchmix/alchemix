@@ -1,0 +1,39 @@
+{
+  "name": "my-style",
+  "css_files": ["styles.css"],
+  "segment_splitter": {
+    "type": "limit_by_chars",
+    "min_limit": 12,
+    "max_limit": 22,
+    "respect_punctuation": true
+  },
+  "semantic_tagger": {
+    "rules": [
+      {
+        "tag": "keyword",
+        "instructions": "important nouns, key objects, weapons, vehicles, locations, or historical concepts"
+      },
+      {
+        "tag": "action",
+        "instructions": "strong verbs such as attack, defend, retreat, explode, charge, surrender"
+      }
+    ]
+  },
+  "animations": [
+    {
+      "type": "zoom_in",
+      "duration": 0.25,
+      "init_scale": 0.75,
+      "overshoot": { "amount": 0.15 },
+      "when": "ON_NARRATION_STARTS",
+      "what": "WORD",
+      "tag_condition": "keyword or action"
+    },
+    {
+      "type": "fade_in",
+      "duration": 0.35,
+      "when": "ON_SEGMENT_APPEARS",
+      "what": "SEGMENT"
+    }
+  ]
+}
