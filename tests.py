@@ -3,6 +3,7 @@ import yt_dlp
 import requests
 import os
 import base64
+from contextlib import contextmanager
 from threading import Semaphore
 import time
 import json
@@ -22,7 +23,6 @@ from moviepy.editor import VideoFileClip, ImageClip, concatenate_videoclips, Aud
 # import moviepy.video.fx.all as vfx
 from tempfile import TemporaryDirectory
 from PIL import Image, ImageFilter,ImageDraw,ImageFont
-import torch
 import numpy as np
 import cv2
 import openai
@@ -41,16 +41,30 @@ from functools import lru_cache
 import os, uuid, glob, logging, subprocess
 from math import ceil, floor
 # from video_helper.segment_narration import segment_narration
-# Import YOLO
-from ultralytics import YOLO
 import multiprocessing
-from mongodb import mongo_instance
-# Import CLIP model and processor
-from transformers import CLIPProcessor, CLIPModel
 import psutil
 from functools import lru_cache, wraps
 from datetime import datetime, timedelta
 from threading import Lock
+
+
+class _LazyTorchModule:
+    """Defer `import torch` until first attribute access (avoids CUDA init in pool workers)."""
+
+    _module = None
+
+    def _load(self):
+        if _LazyTorchModule._module is None:
+            import torch as _torch_mod
+            _LazyTorchModule._module = _torch_mod
+        return _LazyTorchModule._module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+torch = _LazyTorchModule()
+
 
 # ----------------- Configuration -----------------
 _MEMORY_THRESHOLD = 85  # Percentage of RAM usage that triggers cleanup
@@ -237,12 +251,77 @@ import threading
 
 GRADIO_URL = os.getenv("GRADIO_URL", "http://127.0.0.1:7860")  # or your host
 
+# Storyboard API back-pressure: shared across ALL segment worker processes via
+# global_render_scheduler (Manager semaphore). Fallback threading sem for legacy paths.
+STORYBOARD_MAX_CONCURRENT = max(1, int(os.getenv("STORYBOARD_MAX_CONCURRENT", "5")))
+# Must stay BELOW SEGMENT_WALL_TIMEOUT_SEC (default 420). Otherwise the pool
+# kills/requeues the segment before storyboard can timeout and fall back to Ken Burns.
+STORYBOARD_TIMEOUT_SEC = float(os.getenv("STORYBOARD_TIMEOUT_SEC", "120"))
+STORYBOARD_SLOT_TIMEOUT_SEC = float(
+    os.getenv("STORYBOARD_SLOT_TIMEOUT_SEC", str(max(60, STORYBOARD_TIMEOUT_SEC + 30)))
+)
+MEDIA_LOCK_TIMEOUT_SEC = int(os.getenv("MEDIA_LOCK_TIMEOUT_SEC", "120"))
+_storyboard_sem_fallback = threading.Semaphore(STORYBOARD_MAX_CONCURRENT)
+_storyboard_sem_holder: dict = {"sem": None}
+
+
+def _storyboard_tuning(segment_fps: int = 30) -> dict:
+    """Env-driven storyboard speed/quality knobs (P1)."""
+    fps_env = os.getenv("STORYBOARD_FPS")
+    return {
+        "split_len": int(os.getenv("STORYBOARD_SPLIT_LEN", "20")),
+        "fps": int(fps_env) if fps_env else int(segment_fps),
+        "obj_skip": int(os.getenv("STORYBOARD_OBJ_SKIP", "12")),
+        "bg_skip": int(os.getenv("STORYBOARD_BG_SKIP", "20")),
+        "hold_fraction": float(os.getenv("STORYBOARD_HOLD_FRACTION", "0.25")),
+    }
+
+
+def _register_storyboard_semaphore(sem) -> None:
+    _storyboard_sem_holder["sem"] = sem
+
+
+def _acquire_storyboard_slot(label: str = "") -> None:
+    sem = _storyboard_sem_holder.get("sem") or _storyboard_sem_fallback
+    if label:
+        logging.info(f"⏳ Storyboard: waiting for slot ({label})...")
+    if not sem.acquire(timeout=STORYBOARD_SLOT_TIMEOUT_SEC):
+        raise TimeoutError(
+            f"Storyboard slot unavailable after {STORYBOARD_SLOT_TIMEOUT_SEC:.0f}s ({label}) — "
+            f"a worker may have died while holding the slot; restart wsgi.py"
+        )
+    if label:
+        logging.info(f"🎨 Storyboard: slot acquired ({label})")
+
+
+def _release_storyboard_slot(label: str = "") -> None:
+    sem = _storyboard_sem_holder.get("sem") or _storyboard_sem_fallback
+    sem.release()
+    if label:
+        logging.info(f"🎨 Storyboard: slot released ({label})")
+
+
+@contextmanager
+def media_lock_guard(media_lock, label: str = ""):
+    """Timeout wrapper — avoids permanent deadlock if a worker dies while holding Manager lock."""
+    if label:
+        logging.debug(f"⏳ media_lock wait ({label})...")
+    if not media_lock.acquire(timeout=MEDIA_LOCK_TIMEOUT_SEC):
+        raise TimeoutError(
+            f"media_lock timeout after {MEDIA_LOCK_TIMEOUT_SEC}s ({label}) — "
+            f"a worker likely died while holding the lock; restart wsgi.py"
+        )
+    try:
+        yield
+    finally:
+        media_lock.release()
+
 
 # -------------------------------------------
 # GLOBAL CLIENT POOL (thread-safe)
 # -------------------------------------------
 
-MAX_CLIENTS = 8          # how many simultaneous predict() workers
+MAX_CLIENTS = STORYBOARD_MAX_CONCURRENT  # aligned with storyboard capacity
 _executor = ThreadPoolExecutor(max_workers=MAX_CLIENTS)
 _client_lock = threading.Lock()
 _clients = []            # pool of persistent clients
@@ -274,16 +353,55 @@ def storyboard_from_api_parallel(
     bg_object_skip_rate=14,
     end_gray_img_duration_in_sec=0,
     target_dur_sec=None,
+    hold_fraction=0.25,
 ):
     """
     Submit ONE storyboard job to the thread pool.
     Returns a Future that resolves to a video path string.
-    Identical to your original return type.
+    Slot is held only until timeout or completion (no leak on future.cancel()).
     """
 
     def _task():
-        client = _get_client()
+        return _storyboard_call_sync(
+            image_path=image_path,
+            split_len=split_len,
+            fps=fps,
+            object_skip_rate=object_skip_rate,
+            bg_object_skip_rate=bg_object_skip_rate,
+            end_gray_img_duration_in_sec=end_gray_img_duration_in_sec,
+            target_dur_sec=target_dur_sec,
+            hold_fraction=hold_fraction,
+        )
+
+    return _executor.submit(_task)
+
+
+def _storyboard_call_sync(
+    image_path: str,
+    split_len="10",
+    fps=30,
+    object_skip_rate=8,
+    bg_object_skip_rate=14,
+    end_gray_img_duration_in_sec=0,
+    target_dur_sec=None,
+    hold_fraction=0.25,
+    timeout_sec: float | None = None,
+):
+    """
+    Call Gradio /main_func with caller-side slot + wall timeout.
+    On timeout the slot is released immediately; orphan Gradio work may continue
+    in a daemon thread (server-side concurrency still caps parallel renders).
+    """
+    label = os.path.basename(str(image_path)) if image_path else "storyboard"
+    wait_sec = STORYBOARD_TIMEOUT_SEC if timeout_sec is None else float(timeout_sec)
+    result_box: list = []
+    error_box: list = []
+    done = threading.Event()
+
+    def _run():
+        client = None
         try:
+            client = _get_client()
             res = client.predict(
                 image=handle_file(image_path),
                 split_len=split_len,
@@ -292,16 +410,40 @@ def storyboard_from_api_parallel(
                 bg_object_skip_rate=bg_object_skip_rate,
                 end_gray_img_duration_in_sec=end_gray_img_duration_in_sec,
                 target_dur_sec=target_dur_sec,
+                hold_fraction=hold_fraction,
                 api_name="/main_func",
             )
             if isinstance(res, dict) and "video" in res:
-                return res["video"]
-            return res
+                result_box.append(res["video"])
+            else:
+                result_box.append(res)
+        except Exception as exc:
+            error_box.append(exc)
         finally:
-            _return_client(client)
+            if client is not None:
+                _return_client(client)
+            done.set()
 
-    # Run in executor instead of blocking
-    return _executor.submit(_task)
+    _acquire_storyboard_slot(label)
+    try:
+        t = threading.Thread(target=_run, daemon=True, name=f"storyboard-{label}")
+        t.start()
+        if not done.wait(timeout=wait_sec):
+            logging.warning(
+                f"Storyboard timed out after {wait_sec:.0f}s ({label}) — "
+                f"slot released; orphan Gradio call may still finish in background"
+            )
+            raise TimeoutError(
+                f"Storyboard API timed out after {wait_sec:.0f}s "
+                f"(max_concurrent={STORYBOARD_MAX_CONCURRENT})"
+            )
+        if error_box:
+            raise error_box[0]
+        if not result_box:
+            raise RuntimeError(f"Storyboard returned no result ({label})")
+        return result_box[0]
+    finally:
+        _release_storyboard_slot(label)
 
 
 
@@ -488,12 +630,10 @@ def storyboard_from_api(
     bg_object_skip_rate: int = 14,
     end_gray_img_duration_in_sec: int = 0,
     target_dur_sec: float | None = None,
+    hold_fraction: float = 0.25,
 ):
-    """
-    Parallel version: returns exactly the same output,
-    but internally uses a parallel client executor.
-    """
-    future = storyboard_from_api_parallel(
+    """Blocking storyboard call with timeout-safe slot release."""
+    return _storyboard_call_sync(
         image_path=image_path,
         split_len=split_len,
         fps=fps,
@@ -501,10 +641,8 @@ def storyboard_from_api(
         bg_object_skip_rate=bg_object_skip_rate,
         end_gray_img_duration_in_sec=end_gray_img_duration_in_sec,
         target_dur_sec=target_dur_sec,
+        hold_fraction=hold_fraction,
     )
-
-    # BLOCK here to keep your existing pipeline unchanged
-    return future.result()     # identical behaviour
 
 
 #----------------------Story Boar d Close---------------------
@@ -553,10 +691,38 @@ def get_clip_model():
 
     return _clip_model, _clip_processor
 
-# Initialize YOLO
-yolo_model = YOLO("yolov8n.pt")
+_db = None
 
-db = mongo_instance.get_db()
+
+def _mongo_instance():
+    """Defer mongodb import so Atlas blips during worker exec_module do not abort load."""
+    import mongodb
+
+    inst = getattr(mongodb, "mongo_instance", None)
+    if inst is None:
+        raise RuntimeError(
+            "mongodb.mongo_instance is missing — MongoDB failed to initialize in mongodb.py "
+            "(check Atlas primary / connection string)"
+        )
+    return inst
+
+
+def get_db():
+    """Lazy Mongo handle — avoid get_db() on import (segment pool exec_module)."""
+    global _db
+    if _db is None:
+        _db = _mongo_instance().get_db()
+    return _db
+
+
+class _LazyDB:
+    """Legacy `db` attribute access without connecting at import time."""
+
+    def __getattr__(self, name):
+        return getattr(get_db(), name)
+
+
+db = _LazyDB()
 # Ensure the directory exists
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -616,583 +782,624 @@ def apply_storyboard_transitions(clips, transition_dur=STORYBOARD_TRANSITION_DUR
 
 #I---------------------VIDEO DOWNLOAD FUNCTIONS START---------------------I
 
-# def download_video_segment(user_id,url, output_path, start_time, end_time, effect=None, retries=3):
-#     """
-#     Downloads a video segment from a URL and applies FFmpeg manipulation with optional effects.
-#     Effects: "zoom", "mirror", "zoom+mirror"
-#     """
-
-#         # Validate time range
-#     if start_time is None or end_time is None or end_time <= start_time:
-#         logging.warning(f"Invalid time range: start_time={start_time}, end_time={end_time}. Skipping download.")
-#         return None
-
-#     temp_raw_path = f"{output_path}.{uuid.uuid4()}.raw.mp4"
-    
-#     for attempt in range(retries):
-#         try:
-#             # Step 1: Download
-#             ydl_opts = {
-#                 'format': 'bestvideo+bestaudio/best',
-#                 'outtmpl': temp_raw_path,
-#                 'merge_output_format': 'mp4',
-#                 'quiet': False,
-#                 'progress_hooks': [progress_hook],
-#                 'download_ranges': lambda _, __: [{'start_time': start_time, 'end_time': end_time}],
-#                 'force_keyframes_at_cuts': True,
-#                 'retries': retries,
-#                 'force-generic-extractor': True,
-#                 'cookiesfrombrowser': ('firefox',),
-#                 'postprocessors': [{
-#                     'key': 'FFmpegVideoConvertor',
-#                     'preferedformat': 'mp4',
-#                 }]
-#             }
-
-#             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-#                 ydl.download([url])
-
-#             if not (os.path.exists(temp_raw_path) and os.path.getsize(temp_raw_path) > 0):
-#                 raise Exception(f"Download failed: Empty or missing file at {temp_raw_path}")
-
-#             # Step 2: Build filter based on effect
-#             effect_chain = "[main]"
-#             if effect == "zoom":
-#                 effect_chain += "scale=1.5*iw:1.5*ih"
-#             elif effect == "mirror":
-#                 effect_chain += "hflip"
-#             elif effect == "zoom+mirror":
-#                 effect_chain += "scale=1.5*iw:1.5*ih,hflip"
-#             else:
-#                 effect_chain += "null"  # no effect
-
-#             effect_chain += "[processed];"
-
-#             # FFmpeg command
-#             # command = [
-#             #     "ffmpeg",
-#             #     "-i", temp_raw_path,
-#             #     "-lavfi",
-#             #     "[0:v]split=2[main][blur];"
-#             #     "[blur]scale=ih*16/9:-1,"
-#             #     "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
-#             #     "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
-#             #     f"{effect_chain}"
-#             #     "[bg][processed]overlay=(W-w)/2:(H-h)/2,"
-#             #     "crop=h=iw*9/16",
-#             #     "-vb", "800K",
-#             #     output_path
-#             # ]
-#             command = [
-#     "ffmpeg",
-#     "-i", temp_raw_path,                   # Input video
-#     "-i", "logo.jpg",                      # Input logo image (overlay)
-#     "-filter_complex",
-#     "[0:v]split=2[main][blur];"
-#     "[blur]scale=ih*16/9:-1,"
-#     "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
-#     "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
-
-#     f"{effect_chain}"                      # Effect chain: zoom, mirror, etc.
-
-#     "[bg][processed]overlay=(W-w)/2:(H-h)/2,"
-#     "crop=h=iw*9/16,"
-#     "eq=contrast=1.05:saturation=1.15:brightness=0.01,"
-#     "setpts=PTS/1.03[video];"              # Slight speed-up and color tweak
-
-#     "[video][1:v]overlay=W-w-10:H-h-10"    # Logo in bottom right
-#     ,
-#     "-af", "asetrate=44100*1.03,aresample=44100,atempo=1.03",  # Audio pitch/speed
-#     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#     "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#     "-profile:v", "high", "-pix_fmt", "yuv420p",
-#     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#     "-c:a", "aac", "-b:a", "192k",
-#     "-movflags", "+faststart",
-#     "-y", output_path
-# ]
-
-
-#             subprocess.run(command, check=True)
-
-#             # Clean up
-#             if os.path.exists(temp_raw_path):
-#                 os.remove(temp_raw_path)
-
-#             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-#                 return output_path
-#             else:
-#                 logging.warning(f"Manipulated video failed to save at {output_path}")
-
-#         except Exception as e:
-#             logging.error(f"Attempt {attempt + 1} failed - {e}")
-#             for path in [temp_raw_path, output_path]:
-#                 if os.path.exists(path):
-#                     try:
-#                         os.remove(path)
-#                     except:
-#                         pass
-
-#             if attempt < retries - 1:
-#                 wait_time = 2 ** attempt
-#                 logging.info(f"Retrying in {wait_time} seconds...")
-#                 time.sleep(wait_time)
-
-#     return None
-
-# MOST MOST IMPORTANT
-# def download_video_segment(user_id, url, output_path, start_time, end_time, effect=None, retries=3):
-#     """
-#     Downloads a video segment from a URL and applies FFmpeg manipulation with optional effects.
-#     Effects: "zoom", "mirror", "zoom+mirror"
-#     Conditionally applies logo overlay based on user_id.
-#     """
-
-#     # Validate time range
-#     if start_time is None or end_time is None or end_time <= start_time:
-#         logging.warning(f"Invalid time range: start_time={start_time}, end_time={end_time}. Skipping download.")
-#         return None
-
-#     temp_raw_path = f"{output_path}.{uuid.uuid4()}.raw.mp4"
-
-#     for attempt in range(retries):
-#         try:
-#             # Step 1: Download with yt_dlp
-#             ydl_opts = {
-#                 'format': 'bestvideo+bestaudio/best',
-#                 'outtmpl': temp_raw_path,
-#                 'merge_output_format': 'mp4',
-#                 'quiet': False,
-#                 'progress_hooks': [progress_hook],
-#                 'download_ranges': lambda _, __: [{'start_time': start_time, 'end_time': end_time}],
-#                 'force_keyframes_at_cuts': True,
-#                 'retries': retries,
-#                 'force-generic-extractor': True,
-#                 'cookiesfrombrowser': ('firefox',),
-#                 'postprocessors': [{
-#                     'key': 'FFmpegVideoConvertor',
-#                     'preferedformat': 'mp4',
-#                 }]
-#             }
-
-#             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-#                 ydl.download([url])
-
-#             if not (os.path.exists(temp_raw_path) and os.path.getsize(temp_raw_path) > 0):
-#                 raise Exception(f"Download failed: Empty or missing file at {temp_raw_path}")
-
-#             # Step 2: Choose logo based on user_id
-#             logo_path = None
-#             if user_id == "admin@example.com":
-#                 logo_path = "branding/admin_logo.png"
-#             elif user_id.endswith("@company.com"):
-#                 logo_path = "branding/company_logo.png"
-#             else:
-#                 logo_path = ""  # No logo
-
-#             # Step 3: Build effect filter
-#             effect_chain = "[main]"
-#             if effect == "zoom":
-#                 effect_chain += "scale=1.3*iw:1.3*ih"
-#             elif effect == "mirror":
-#                 effect_chain += "hflip"
-#             elif effect == "zoom+mirror":
-#                 effect_chain += "scale=1.3*iw:1.3*ih,hflip"
-#             else:
-#                 effect_chain += "null"
-#             effect_chain += "[processed];"
-
-#             # Step 4: FFmpeg Command
-#             if logo_path:
-#                 command = [
-#     "ffmpeg",
-#     "-i", temp_raw_path,
-#     "-i", logo_path,
-#     "-filter_complex",
-#     "[0:v]split=2[main][blur];"
-#     "[blur]scale=ih*16/9:-1,"
-#     "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
-#     "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
-#     f"{effect_chain}"
-#     "[bg][processed]overlay=(W-w)/2:(H-h)/2,"
-#     "crop=h=iw*9/16,"
-#     "eq=contrast=1.05:saturation=1.15:brightness=0.01[video];"
-#     "[video][1:v]overlay=W-w-10:H-h-10",
-#     "-map", "[video]",
-#     "-map", "0:a",
-#     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#     "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#     "-profile:v", "high", "-pix_fmt", "yuv420p",
-#     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#     "-c:a", "aac", "-b:a", "192k",
-#     "-movflags", "+faststart",
-#     "-shortest",
-#     "-y", output_path
-# ]
-
-#             else:
-#                 command = [
-#     "ffmpeg",
-#     "-i", temp_raw_path,
-#     "-filter_complex",
-#     "[0:v]split=2[main][blur];"
-#     "[blur]scale=ih*16/9:-1,"
-#     "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
-#     "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
-#     f"{effect_chain}"
-#     "[bg][processed]overlay=(W-w)/2:(H-h)/2,"
-#     "crop=h=iw*9/16,"
-#     "eq=contrast=1.05:saturation=1.15:brightness=0.01[video]",
-#     "-map", "[video]",
-#     "-map", "0:a",
-#     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#     "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#     "-profile:v", "high", "-pix_fmt", "yuv420p",
-#     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#     "-c:a", "aac", "-b:a", "192k",
-#     "-movflags", "+faststart",
-#     "-shortest",
-#     "-y", output_path
-# ]
-
-
-#             # Run FFmpeg
-#             subprocess.run(command, check=True)
-
-#             # Cleanup
-#             if os.path.exists(temp_raw_path):
-#                 os.remove(temp_raw_path)
-
-#             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-#                 return output_path
-#             else:
-#                 logging.warning(f"Manipulated video failed to save at {output_path}")
-
-#         except Exception as e:
-#             logging.error(f"Attempt {attempt + 1} failed - {e}")
-#             for path in [temp_raw_path, output_path]:
-#                 if os.path.exists(path):
-#                     try:
-#                         os.remove(path)
-#                     except:
-#                         pass
-
-#             if attempt < retries - 1:
-#                 wait_time = 2 ** attempt
-#                 logging.info(f"Retrying in {wait_time} seconds...")
-#                 time.sleep(wait_time)
-
-#     return None
-
 # def crop_with_audio(input_file, output_file, crop_spec):
 #     """
-#     Crops a video with the specified crop parameters while preserving audio.
-    
-#     Args:
-#         input_file (str): Path to the input video file
-#         output_file (str): Path to the output cropped video file
-#         crop_spec (dict): Dictionary containing crop parameters with keys:
-#                          - x: X coordinate of crop area
-#                          - y: Y coordinate of crop area
-#                          - width: Width of crop area
-#                          - height: Height of crop area
+#     Crops a video with the specified crop parameters while preserving audio,
+#     auto-scaling the crop to the actual input resolution.
 #     """
 #     try:
+#         # Get actual input resolution
+#         probe = ffmpeg.probe(input_file)
+#         stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+#         in_w, in_h = stream['width'], stream['height']
+
+#         # Use expected reference resolution
+#         expected = crop_spec.get("expectedInputResolution", {"width": 1920, "height": 1080})
+#         scale_x = in_w / expected["width"]
+#         scale_y = in_h / expected["height"]
+
+#         # Apply scaling
+#         x = int(crop_spec["x"] * scale_x)
+#         y = int(crop_spec["y"] * scale_y)
+#         w = int(crop_spec["width"] * scale_x)
+#         h = int(crop_spec["height"] * scale_y)
+
+#         # Validate crop bounds
+#         w = min(w, in_w - x)
+#         h = min(h, in_h - y)
+#         if w <= 0 or h <= 0:
+#             raise ValueError("Invalid crop bounds after scaling.")
+
 #         video = ffmpeg.input(input_file)
-#         cropped = video.video.crop(crop_spec["x"], crop_spec["y"], crop_spec["width"], crop_spec["height"])
+#         cropped = video.video.crop(x, y, w, h)
 #         ffmpeg.output(cropped, video.audio, output_file, vcodec='libx264', acodec='aac').run(overwrite_output=True)
+
 #         logging.info(f"✂️ Cropping completed: {output_file}")
 #         return True
 #     except Exception as e:
 #         logging.error(f"❌ Cropping failed: {e}")
 #         return False
 
+# import os
+# import uuid
+# import time
+# import logging
+# import subprocess
 
-def crop_with_audio(input_file, output_file, crop_spec):
-    """
-    Crops a video with the specified crop parameters while preserving audio,
-    auto-scaling the crop to the actual input resolution.
-    """
-    try:
-        # Get actual input resolution
-        probe = ffmpeg.probe(input_file)
-        stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-        in_w, in_h = stream['width'], stream['height']
-
-        # Use expected reference resolution
-        expected = crop_spec.get("expectedInputResolution", {"width": 1920, "height": 1080})
-        scale_x = in_w / expected["width"]
-        scale_y = in_h / expected["height"]
-
-        # Apply scaling
-        x = int(crop_spec["x"] * scale_x)
-        y = int(crop_spec["y"] * scale_y)
-        w = int(crop_spec["width"] * scale_x)
-        h = int(crop_spec["height"] * scale_y)
-
-        # Validate crop bounds
-        w = min(w, in_w - x)
-        h = min(h, in_h - y)
-        if w <= 0 or h <= 0:
-            raise ValueError("Invalid crop bounds after scaling.")
-
-        video = ffmpeg.input(input_file)
-        cropped = video.video.crop(x, y, w, h)
-        ffmpeg.output(cropped, video.audio, output_file, vcodec='libx264', acodec='aac').run(overwrite_output=True)
-
-        logging.info(f"✂️ Cropping completed: {output_file}")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Cropping failed: {e}")
-        return False
+# import ffmpeg
+# import yt_dlp
 
 
-def download_video_segment(user_id, url, output_path, start_time, end_time,
-                           crop=None, effect=None, retries=3):
-    """
-    Downloads a video segment from a URL and applies FFmpeg manipulation with optional effects.
+# def probe_video_size(input_file):
+#     """Return (width, height) of the first video stream."""
+#     probe = ffmpeg.probe(input_file)
+#     stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+#     return int(stream["width"]), int(stream["height"])
+
+
+# def scale_crop_to_input(crop_spec, input_w, input_h):
+#     """
+#     Scale crop coordinates from UI reference resolution to actual file pixels.
+#     crop_spec must contain x, y, width, height.
+#     expectedInputResolution is optional but strongly recommended from frontend.
+#     """
+#     expected = crop_spec.get("expectedInputResolution") or {}
+#     ref_w = int(expected.get("width") or input_w)
+#     ref_h = int(expected.get("height") or input_h)
+
+#     if ref_w <= 0 or ref_h <= 0:
+#         ref_w, ref_h = input_w, input_h
+
+#     scale_x = input_w / ref_w
+#     scale_y = input_h / ref_h
+
+#     x = int(crop_spec["x"] * scale_x)
+#     y = int(crop_spec["y"] * scale_y)
+#     w = int(crop_spec["width"] * scale_x)
+#     h = int(crop_spec["height"] * scale_y)
+
+#     # Even dimensions for H.264
+#     if w % 2 != 0:
+#         w -= 1
+#     if h % 2 != 0:
+#         h -= 1
+
+#     # Clamp to bounds
+#     x = max(0, min(x, input_w - 2))
+#     y = max(0, min(y, input_h - 2))
+#     w = min(w, input_w - x)
+#     h = min(h, input_h - y)
+
+#     if w <= 0 or h <= 0:
+#         raise ValueError(
+#             f"Invalid crop after scaling: x={x}, y={y}, w={w}, h={h}, "
+#             f"input={input_w}x{input_h}, ref={ref_w}x{ref_h}"
+#         )
+
+#     return x, y, w, h
+
+
+# def crop_with_audio(input_file, output_file, crop_spec):
+#     """
+#     Crops a video with the specified crop parameters while preserving audio.
+#     Auto-scales crop coords from expectedInputResolution to actual input size.
+#     """
+#     try:
+#         in_w, in_h = probe_video_size(input_file)
+#         x, y, w, h = scale_crop_to_input(crop_spec, in_w, in_h)
+
+#         logging.info(
+#             f"crop_with_audio: ref={crop_spec.get('expectedInputResolution')} "
+#             f"actual={in_w}x{in_h} → crop={x},{y},{w}x{h}"
+#         )
+
+#         video = ffmpeg.input(input_file)
+#         cropped = video.video.crop(x, y, w, h)
+
+#         ffmpeg.output(
+#             cropped,
+#             video.audio,
+#             output_file,
+#             vcodec="libx264",
+#             acodec="aac",
+#         ).run(overwrite_output=True)
+
+#         logging.info(f"✂️ Cropping completed: {output_file}")
+#         return True
+
+#     except Exception as e:
+#         logging.error(f"❌ Cropping failed: {e}")
+#         return False
+
+
+# def download_video_segment(
+#     user_id,
+#     url,
+#     output_path,
+#     start_time,
+#     end_time,
+#     crop=None,
+#     effect=None,
+#     retries=3,
+# ):
+#     """
+#     Downloads a video segment from a URL and applies FFmpeg manipulation
+#     with optional effects.
+
+#     Args:
+#         user_id: User identifier for logo selection
+#         url: Video URL to download
+#         output_path: Final output file path
+#         start_time: Start time in seconds
+#         end_time: End time in seconds
+#         crop: {
+#             "x": int, "y": int, "width": int, "height": int,
+#             "expectedInputResolution": {"width": int, "height": int}  # from frontend
+#         } or None
+#         effect: "zoom", "mirror", "zoom+mirror", or None
+#         retries: Number of retry attempts
+
+#     Returns:
+#         output_path if successful, None if failed
+#     """
+
+#     if start_time is None or end_time is None or end_time <= start_time:
+#         logging.warning(
+#             f"Invalid time range: start_time={start_time}, end_time={end_time}. Skipping download."
+#         )
+#         return None
+
+#     temp_raw_path = f"{output_path}.{uuid.uuid4()}.raw.mp4"
+#     temp_crop_path = f"{output_path}.{uuid.uuid4()}.crop.mp4" if crop else None
+
+#     for attempt in range(retries):
+#         try:
+#             # -------------------------
+#             # YT-DLP DOWNLOAD
+#             # -------------------------
+#             ydl_opts = {
+#                 "format": (
+#                     "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+#                     "bestvideo[height<=1080]+bestaudio/best"
+#                 ),
+#                 "outtmpl": temp_raw_path,
+#                 "merge_output_format": "mp4",
+#                 "quiet": False,
+#                 "progress_hooks": [progress_hook],
+#                 "download_ranges": lambda _, __: [
+#                     {"start_time": start_time, "end_time": end_time}
+#                 ],
+#                 "force_keyframes_at_cuts": True,
+#                 "retries": retries,
+#                 "extractor_args": {
+#                     "youtube": {
+#                         "player_client": ["default", "web", "android"]
+#                     }
+#                 },
+#             }
+
+#             logging.info(f"📥 Downloading segment from {start_time}s to {end_time}s...")
+
+#             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+#                 ydl.download([url])
+
+#             if not (os.path.exists(temp_raw_path) and os.path.getsize(temp_raw_path) > 0):
+#                 raise Exception(f"Download failed: Empty or missing file at {temp_raw_path}")
+
+#             input_path = temp_raw_path
+
+#             # -------------------------
+#             # OPTIONAL CROPPING (scaled to actual download resolution)
+#             # -------------------------
+#             if crop and isinstance(crop, dict) and all(
+#                 k in crop for k in ["x", "y", "width", "height"]
+#             ):
+#                 logging.info("✂️ Applying custom crop...")
+
+#                 in_w, in_h = probe_video_size(temp_raw_path)
+#                 x, y, w, h = scale_crop_to_input(crop, in_w, in_h)
+
+#                 logging.info(
+#                     f"download_video_segment crop: ref={crop.get('expectedInputResolution')} "
+#                     f"actual={in_w}x{in_h} → crop={x},{y},{w}x{h}"
+#                 )
+
+#                 crop_cmd = [
+#                     "ffmpeg", "-y",
+#                     "-i", temp_raw_path,
+#                     "-filter:v", f"crop={w}:{h}:{x}:{y}",
+#                     "-c:a", "copy",
+#                     temp_crop_path,
+#                 ]
+
+#                 result = subprocess.run(crop_cmd, capture_output=True, text=True)
+#                 if result.returncode != 0:
+#                     logging.error(f"Crop FFmpeg error: {result.stderr}")
+#                     raise Exception("Cropping failed")
+
+#                 if not os.path.exists(temp_crop_path) or os.path.getsize(temp_crop_path) == 0:
+#                     raise Exception("Cropping failed: output file missing or empty")
+
+#                 input_path = temp_crop_path
+#                 logging.info("✅ Crop applied successfully")
+
+#             # -------------------------
+#             # LOGO SELECTION
+#             # -------------------------
+#             logo_path = None
+#             if user_id == "admin@example.com":
+#                 logo_path = "branding/admin_logo.png"
+#             elif user_id and user_id.endswith("@company.com"):
+#                 logo_path = "branding/company_logo.png"
+
+#             if logo_path and not os.path.exists(logo_path):
+#                 logging.warning(f"Logo path {logo_path} not found, skipping logo overlay")
+#                 logo_path = None
+
+#             # -------------------------
+#             # BUILD EFFECT FILTERS
+#             # -------------------------
+#             effect_filters = []
+
+#             if effect == "zoom":
+#                 effect_filters.append("scale=1.3*iw:1.3*ih")
+#             elif effect == "mirror":
+#                 effect_filters.append("hflip")
+#             elif effect == "zoom+mirror":
+#                 effect_filters.append("scale=1.3*iw:1.3*ih")
+#                 effect_filters.append("hflip")
+
+#             if effect_filters:
+#                 effect_stage = f"[main]{','.join(effect_filters)}[processed];"
+#             else:
+#                 effect_stage = "[main]null[processed];"
+
+#             # Only auto 9:16 crop when user did NOT provide custom crop
+#             auto_crop_filter = "" if crop else "crop=h=iw*9/16,"
+
+#             base_filter_graph = (
+#                 "[0:v]split=2[main][blur];"
+#                 "[blur]scale=1920:1080:force_original_aspect_ratio=increase,"
+#                 "crop=1920:1080,"
+#                 "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
+#                 "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
+#                 f"{effect_stage}"
+#                 "[processed]scale=1920:1080:force_original_aspect_ratio=decrease[scaled];"
+#                 "[bg][scaled]overlay=(W-w)/2:(H-h)/2,"
+#                 f"{auto_crop_filter}"
+#                 "eq=contrast=1.05:saturation=1.15:brightness=0.01[video]"
+#             )
+
+#             if logo_path:
+#                 filter_graph = base_filter_graph + ";[video][1:v]overlay=W-w-10:H-h-10[final]"
+#                 map_output = "[final]"
+#             else:
+#                 filter_graph = base_filter_graph
+#                 map_output = "[video]"
+
+#             command = ["ffmpeg", "-y", "-i", input_path]
+
+#             if logo_path:
+#                 command += ["-i", logo_path]
+
+#             command += [
+#                 "-filter_complex", filter_graph,
+#                 "-map", map_output,
+#                 "-map", "0:a?",
+#                 "-c:v", "h264_nvenc",
+#                 "-preset", "p5",
+#                 "-tune", "hq",
+#                 "-rc", "vbr",
+#                 "-b:v", "8M",
+#                 "-maxrate", "12M",
+#                 "-bufsize", "24M",
+#                 "-profile:v", "high",
+#                 "-pix_fmt", "yuv420p",
+#                 "-colorspace", "bt709",
+#                 "-color_primaries", "bt709",
+#                 "-color_trc", "bt709",
+#                 "-c:a", "aac",
+#                 "-b:a", "192k",
+#                 "-movflags", "+faststart",
+#                 "-shortest",
+#                 output_path,
+#             ]
+
+#             logging.info("🎬 Processing video with FFmpeg...")
+
+#             result = subprocess.run(command, capture_output=True, text=True)
+
+#             if result.returncode != 0:
+#                 logging.error(f"FFmpeg error: {result.stderr}")
+#                 raise Exception(f"FFmpeg processing failed with code {result.returncode}")
+
+#             for path in [temp_raw_path, temp_crop_path]:
+#                 if path and os.path.exists(path):
+#                     try:
+#                         os.remove(path)
+#                     except Exception as e:
+#                         logging.warning(f"Failed to remove {path}: {e}")
+
+#             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+#                 logging.info(f"✅ Video segment created successfully: {output_path}")
+#                 return output_path
+
+#             raise Exception(f"Final output file is empty or missing: {output_path}")
+
+#         except Exception as e:
+#             logging.error(f"❌ Attempt {attempt + 1}/{retries} failed: {e}")
+
+#             for path in [temp_raw_path, temp_crop_path, output_path]:
+#                 if path and os.path.exists(path):
+#                     try:
+#                         os.remove(path)
+#                     except Exception:
+#                         pass
+
+#             if attempt < retries - 1:
+#                 wait_time = 2 ** attempt
+#                 logging.info(f"⏳ Retrying in {wait_time} seconds...")
+#                 time.sleep(wait_time)
+#             else:
+#                 logging.error(f"❌ All {retries} attempts failed for {url}")
+
+#     return None
+
+# def download_video_segment(user_id, url, output_path, start_time, end_time,
+#                            crop=None, effect=None, retries=3):
+#     """
+#     Downloads a video segment from a URL and applies FFmpeg manipulation with optional effects.
     
-    Args:
-        user_id: User identifier for logo selection
-        url: Video URL to download
-        output_path: Final output file path
-        start_time: Start time in seconds
-        end_time: End time in seconds
-        crop: Dictionary containing {"x": int, "y": int, "width": int, "height": int} or None
-        effect: Effect to apply - "zoom", "mirror", "zoom+mirror", or None
-        retries: Number of retry attempts
+#     Args:
+#         user_id: User identifier for logo selection
+#         url: Video URL to download
+#         output_path: Final output file path
+#         start_time: Start time in seconds
+#         end_time: End time in seconds
+#         crop: Dictionary containing {"x": int, "y": int, "width": int, "height": int} or None
+#         effect: Effect to apply - "zoom", "mirror", "zoom+mirror", or None
+#         retries: Number of retry attempts
     
-    Returns:
-        output_path if successful, None if failed
-    """
+#     Returns:
+#         output_path if successful, None if failed
+#     """
 
-    if start_time is None or end_time is None or end_time <= start_time:
-        logging.warning(
-            f"Invalid time range: start_time={start_time}, end_time={end_time}. Skipping download.")
-        return None
+#     if start_time is None or end_time is None or end_time <= start_time:
+#         logging.warning(
+#             f"Invalid time range: start_time={start_time}, end_time={end_time}. Skipping download.")
+#         return None
 
-    temp_raw_path = f"{output_path}.{uuid.uuid4()}.raw.mp4"
-    temp_crop_path = f"{output_path}.{uuid.uuid4()}.crop.mp4" if crop else None
+#     temp_raw_path = f"{output_path}.{uuid.uuid4()}.raw.mp4"
+#     temp_crop_path = f"{output_path}.{uuid.uuid4()}.crop.mp4" if crop else None
 
-    for attempt in range(retries):
-        try:
-            # -------------------------
-            # YT-DLP DOWNLOAD
-            # -------------------------
-            ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
-                'outtmpl': temp_raw_path,
-                'merge_output_format': 'mp4',
-                'quiet': False,
-                'progress_hooks': [progress_hook],
-                'download_ranges': lambda _, __: [
-                    {'start_time': start_time, 'end_time': end_time}
-                ],
-                'force_keyframes_at_cuts': True,
-                'retries': retries,
+#     for attempt in range(retries):
+#         try:
+#             # -------------------------
+#             # YT-DLP DOWNLOAD
+#             # -------------------------
+#             ydl_opts = {
+#                 'format': 'bestvideo+bestaudio/best',
+#                 'outtmpl': temp_raw_path,
+#                 'merge_output_format': 'mp4',
+#                 'quiet': False,
+#                 'progress_hooks': [progress_hook],
+#                 'download_ranges': lambda _, __: [
+#                     {'start_time': start_time, 'end_time': end_time}
+#                 ],
+#                 'force_keyframes_at_cuts': True,
+#                 'retries': retries,
 
-                # Critical Fix for 2026 yt-dlp
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['default', 'web', 'android']
-                    }
-                }
-            }
+#                 # Critical Fix for 2026 yt-dlp
+#                 'extractor_args': {
+#                     'youtube': {
+#                         'player_client': ['default', 'web', 'android']
+#                     }
+#                 }
+#             }
 
-            logging.info(f"📥 Downloading segment from {start_time}s to {end_time}s...")
+#             logging.info(f"📥 Downloading segment from {start_time}s to {end_time}s...")
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+#             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+#                 ydl.download([url])
 
-            if not (os.path.exists(temp_raw_path) and os.path.getsize(temp_raw_path) > 0):
-                raise Exception(
-                    f"Download failed: Empty or missing file at {temp_raw_path}")
+#             if not (os.path.exists(temp_raw_path) and os.path.getsize(temp_raw_path) > 0):
+#                 raise Exception(
+#                     f"Download failed: Empty or missing file at {temp_raw_path}")
 
-            input_path = temp_raw_path
+#             input_path = temp_raw_path
 
-            # -------------------------
-            # OPTIONAL CROPPING
-            # -------------------------
-            if crop and isinstance(crop, dict) and all(k in crop for k in ["x", "y", "width", "height"]):
-                logging.info("✂️  Applying custom crop...")
+#             # -------------------------
+#             # OPTIONAL CROPPING
+#             # -------------------------
+#             if crop and isinstance(crop, dict) and all(k in crop for k in ["x", "y", "width", "height"]):
+#                 logging.info("✂️  Applying custom crop...")
 
-                crop_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", temp_raw_path,
-                    "-filter:v",
-                    f"crop={crop['width']}:{crop['height']}:{crop['x']}:{crop['y']}",
-                    "-c:a", "copy",
-                    temp_crop_path
-                ]
+#                 crop_cmd = [
+#                     "ffmpeg", "-y",
+#                     "-i", temp_raw_path,
+#                     "-filter:v",
+#                     f"crop={crop['width']}:{crop['height']}:{crop['x']}:{crop['y']}",
+#                     "-c:a", "copy",
+#                     temp_crop_path
+#                 ]
 
-                subprocess.run(crop_cmd, check=True, capture_output=True)
+#                 subprocess.run(crop_cmd, check=True, capture_output=True)
 
-                if not os.path.exists(temp_crop_path) or os.path.getsize(temp_crop_path) == 0:
-                    raise Exception("Cropping failed: output file missing or empty")
+#                 if not os.path.exists(temp_crop_path) or os.path.getsize(temp_crop_path) == 0:
+#                     raise Exception("Cropping failed: output file missing or empty")
 
-                input_path = temp_crop_path
-                logging.info("✅ Crop applied successfully")
+#                 input_path = temp_crop_path
+#                 logging.info("✅ Crop applied successfully")
 
-            # -------------------------
-            # LOGO SELECTION
-            # -------------------------
-            logo_path = None
-            if user_id == "admin@example.com":
-                logo_path = "branding/admin_logo.png"
-            elif user_id and user_id.endswith("@company.com"):
-                logo_path = "branding/company_logo.png"
+#             # -------------------------
+#             # LOGO SELECTION
+#             # -------------------------
+#             logo_path = None
+#             if user_id == "admin@example.com":
+#                 logo_path = "branding/admin_logo.png"
+#             elif user_id and user_id.endswith("@company.com"):
+#                 logo_path = "branding/company_logo.png"
             
-            # Verify logo exists if specified
-            if logo_path and not os.path.exists(logo_path):
-                logging.warning(f"Logo path {logo_path} not found, skipping logo overlay")
-                logo_path = None
+#             # Verify logo exists if specified
+#             if logo_path and not os.path.exists(logo_path):
+#                 logging.warning(f"Logo path {logo_path} not found, skipping logo overlay")
+#                 logo_path = None
 
-            # -------------------------
-            # BUILD EFFECT FILTERS
-            # -------------------------
-            effect_filters = []
+#             # -------------------------
+#             # BUILD EFFECT FILTERS
+#             # -------------------------
+#             effect_filters = []
             
-            if effect == "zoom":
-                effect_filters.append("scale=1.3*iw:1.3*ih")
-            elif effect == "mirror":
-                effect_filters.append("hflip")
-            elif effect == "zoom+mirror":
-                effect_filters.append("scale=1.3*iw:1.3*ih")
-                effect_filters.append("hflip")
+#             if effect == "zoom":
+#                 effect_filters.append("scale=1.3*iw:1.3*ih")
+#             elif effect == "mirror":
+#                 effect_filters.append("hflip")
+#             elif effect == "zoom+mirror":
+#                 effect_filters.append("scale=1.3*iw:1.3*ih")
+#                 effect_filters.append("hflip")
             
-            # Build the effect stage with proper syntax
-            if effect_filters:
-                effect_stage = f"[main]{','.join(effect_filters)}[processed];"
-            else:
-                effect_stage = "[main]null[processed];"
+#             # Build the effect stage with proper syntax
+#             if effect_filters:
+#                 effect_stage = f"[main]{','.join(effect_filters)}[processed];"
+#             else:
+#                 effect_stage = "[main]null[processed];"
 
-            # -------------------------
-            # BUILD AUTO-CROP FILTER
-            # -------------------------
-            # Only apply automatic 9:16 crop if user didn't provide custom crop
-            # This ensures vertical videos fit properly in 16:9 frame
-            auto_crop_filter = "" if crop else "crop=h=iw*9/16,"
+#             # -------------------------
+#             # BUILD AUTO-CROP FILTER
+#             # -------------------------
+#             # Only apply automatic 9:16 crop if user didn't provide custom crop
+#             auto_crop_filter = "" if crop else "crop=h=iw*9/16,"
 
-            # -------------------------
-            # BUILD COMPLETE FILTER GRAPH
-            # -------------------------
-            base_filter_graph = (
-                "[0:v]split=2[main][blur];"
-                "[blur]scale=ih*16/9:-1,"
-                "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
-                "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
-                f"{effect_stage}"
-                "[bg][processed]overlay=(W-w)/2:(H-h)/2,"
-                f"{auto_crop_filter}"
-                "eq=contrast=1.05:saturation=1.15:brightness=0.01[video]"
-            )
+#             # -------------------------
+#             # BUILD COMPLETE FILTER GRAPH
+#             # Blur background always fills 1920x1080.
+#             # Processed content is scaled to fit within canvas (no stretch).
+#             # Overlaid centered on blur background for professional feel.
+#             # Output is always exactly 1920x1080 regardless of crop or source.
+#             # -------------------------
+#             base_filter_graph = (
+#                 "[0:v]split=2[main][blur];"
+#                 "[blur]scale=1920:1080:force_original_aspect_ratio=increase,"
+#                 "crop=1920:1080,"
+#                 "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
+#                 "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
+#                 f"{effect_stage}"
+#                 "[processed]scale=1920:1080:force_original_aspect_ratio=decrease[scaled];"
+#                 "[bg][scaled]overlay=(W-w)/2:(H-h)/2,"
+#                 f"{auto_crop_filter}"
+#                 "eq=contrast=1.05:saturation=1.15:brightness=0.01[video]"
+#             )
 
-            # Add logo overlay if present
-            if logo_path:
-                filter_graph = base_filter_graph + ";[video][1:v]overlay=W-w-10:H-h-10[final]"
-                map_output = "[final]"
-            else:
-                filter_graph = base_filter_graph
-                map_output = "[video]"
+#             # Add logo overlay if present
+#             if logo_path:
+#                 filter_graph = base_filter_graph + ";[video][1:v]overlay=W-w-10:H-h-10[final]"
+#                 map_output = "[final]"
+#             else:
+#                 filter_graph = base_filter_graph
+#                 map_output = "[video]"
 
-            # -------------------------
-            # BUILD FFMPEG COMMAND
-            # -------------------------
-            command = ["ffmpeg", "-y", "-i", input_path]
+#             # -------------------------
+#             # BUILD FFMPEG COMMAND
+#             # -------------------------
+#             command = ["ffmpeg", "-y", "-i", input_path]
 
-            if logo_path:
-                command += ["-i", logo_path]
+#             if logo_path:
+#                 command += ["-i", logo_path]
 
-            command += [
-                "-filter_complex", filter_graph,
-                "-map", map_output,
-                "-map", "0:a?",  # Audio optional (? means don't fail if missing)
+#             command += [
+#                 "-filter_complex", filter_graph,
+#                 "-map", map_output,
+#                 "-map", "0:a?",
                 
-                # Video encoding settings
-                "-c:v", "h264_nvenc",
-                "-preset", "p5",
-                "-tune", "hq",
-                "-rc", "vbr",
-                "-b:v", "8M",
-                "-maxrate", "12M",
-                "-bufsize", "24M",
-                "-profile:v", "high",
-                "-pix_fmt", "yuv420p",
+#                 # Video encoding settings
+#                 "-c:v", "h264_nvenc",
+#                 "-preset", "p5",
+#                 "-tune", "hq",
+#                 "-rc", "vbr",
+#                 "-b:v", "8M",
+#                 "-maxrate", "12M",
+#                 "-bufsize", "24M",
+#                 "-profile:v", "high",
+#                 "-pix_fmt", "yuv420p",
                 
-                # Color settings
-                "-colorspace", "bt709",
-                "-color_primaries", "bt709",
-                "-color_trc", "bt709",
+#                 # Color settings
+#                 "-colorspace", "bt709",
+#                 "-color_primaries", "bt709",
+#                 "-color_trc", "bt709",
                 
-                # Audio encoding settings
-                "-c:a", "aac",
-                "-b:a", "192k",
+#                 # Audio encoding settings
+#                 "-c:a", "aac",
+#                 "-b:a", "192k",
                 
-                # Output settings
-                "-movflags", "+faststart",
-                "-shortest",
-                output_path
-            ]
+#                 # Output settings
+#                 "-movflags", "+faststart",
+#                 "-shortest",
+#                 output_path
+#             ]
 
-            logging.info("🎬 Processing video with FFmpeg...")
+#             logging.info("🎬 Processing video with FFmpeg...")
             
-            # Run FFmpeg and capture output for debugging
-            result = subprocess.run(command, capture_output=True, text=True)
+#             result = subprocess.run(command, capture_output=True, text=True)
             
-            if result.returncode != 0:
-                logging.error(f"FFmpeg error: {result.stderr}")
-                raise Exception(f"FFmpeg processing failed with code {result.returncode}")
+#             if result.returncode != 0:
+#                 logging.error(f"FFmpeg error: {result.stderr}")
+#                 raise Exception(f"FFmpeg processing failed with code {result.returncode}")
 
-            # -------------------------
-            # CLEANUP TEMP FILES
-            # -------------------------
-            for path in [temp_raw_path, temp_crop_path]:
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                        logging.debug(f"Cleaned up: {path}")
-                    except Exception as e:
-                        logging.warning(f"Failed to remove {path}: {e}")
+#             # -------------------------
+#             # CLEANUP TEMP FILES
+#             # -------------------------
+#             for path in [temp_raw_path, temp_crop_path]:
+#                 if path and os.path.exists(path):
+#                     try:
+#                         os.remove(path)
+#                         logging.debug(f"Cleaned up: {path}")
+#                     except Exception as e:
+#                         logging.warning(f"Failed to remove {path}: {e}")
 
-            # -------------------------
-            # VERIFY OUTPUT
-            # -------------------------
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logging.info(f"✅ Video segment created successfully: {output_path}")
-                return output_path
-            else:
-                raise Exception(
-                    f"Final output file is empty or missing: {output_path}")
+#             # -------------------------
+#             # VERIFY OUTPUT
+#             # -------------------------
+#             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+#                 logging.info(f"✅ Video segment created successfully: {output_path}")
+#                 return output_path
+#             else:
+#                 raise Exception(
+#                     f"Final output file is empty or missing: {output_path}")
 
-        except Exception as e:
-            logging.error(f"❌ Attempt {attempt + 1}/{retries} failed: {e}")
+#         except Exception as e:
+#             logging.error(f"❌ Attempt {attempt + 1}/{retries} failed: {e}")
 
-            # Cleanup on failure
-            for path in [temp_raw_path, temp_crop_path, output_path]:
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except:
-                        pass
+#             # Cleanup on failure
+#             for path in [temp_raw_path, temp_crop_path, output_path]:
+#                 if path and os.path.exists(path):
+#                     try:
+#                         os.remove(path)
+#                     except:
+#                         pass
 
-            # Retry with exponential backoff
-            if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                logging.info(f"⏳ Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                logging.error(f"❌ All {retries} attempts failed for {url}")
+#             if attempt < retries - 1:
+#                 wait_time = 2 ** attempt
+#                 logging.info(f"⏳ Retrying in {wait_time} seconds...")
+#                 time.sleep(wait_time)
+#             else:
+#                 logging.error(f"❌ All {retries} attempts failed for {url}")
 
-    return None
+#     return None
 
-# def download_video_clips_in_parallel(clip_data_list, section_dir, max_workers=4, max_retries=5):
+# import os
+# import time
+# import logging
+# import concurrent.futures
+
+# def download_video_clips_in_parallel(clip_data_list, section_dir,user_id, max_workers=4, max_retries=5):
 #     os.makedirs(section_dir, exist_ok=True)
 #     downloaded_media = []
 
 #     def task(character_name, yt_url, vidclip):
 #         start = time_to_seconds(vidclip.get("startTime", "0:00:00"))
 #         end = time_to_seconds(vidclip.get("endTime", "0:00:05"))
-#         effect=vidclip.get("effect",None)
+#         effect = vidclip.get("effect", None)
+#         crop=vidclip.get('crop',None)
 
 #         filename = f"{character_name}_{start}_{end}_{int(time.time())}.mp4"
 #         clip_path = os.path.join(section_dir, filename)
@@ -1200,11 +1407,14 @@ def download_video_segment(user_id, url, output_path, start_time, end_time,
 #         for attempt in range(1, max_retries + 1):
 #             try:
 #                 downloaded_path = download_video_segment(
+#                     user_id,
 #                     yt_url,
 #                     clip_path,
 #                     start,
 #                     end,
+#                     crop,
 #                     effect
+                    
 #                 )
 #                 if downloaded_path and os.path.exists(downloaded_path):
 #                     return {
@@ -1213,143 +1423,773 @@ def download_video_segment(user_id, url, output_path, start_time, end_time,
 #                         "start": start,
 #                         "end": end,
 #                         "mute": vidclip.get("mute", False),
-#                         "tag": vidclip.get("tag", None)
+#                         "tag": vidclip.get("tag", None),
+#                         "url": yt_url
 #                     }
 #                 else:
 #                     raise RuntimeError("Downloaded path is invalid or file does not exist.")
 
 #             except Exception as e:
 #                 if attempt < max_retries:
-#                     wait = 2 ** attempt  # exponential backoff
-#                     logging.warning(f"🔁 Retry {attempt}/{max_retries} for {character_name} due to: {e}. Retrying in {wait}s...")
+#                     wait = 2 ** attempt
+#                     logging.warning(f"🔁 Retry {attempt}/{max_retries} for {character_name} - {yt_url}: {e}. Retrying in {wait}s...")
 #                     time.sleep(wait)
 #                 else:
 #                     logging.error(f"❌ Final retry failed for {character_name} - URL: {yt_url} | Error: {e}")
-#                     return None
+#                     return {
+#                         "character": character_name,
+#                         "url": yt_url,
+#                         "error": str(e)
+#                     }
 
 #     futures = []
+#     clip_context_map = {}  # for tracking what each future corresponds to
+
 #     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
 #         for item in clip_data_list:
 #             character = item["characterName"]
 #             for video in item["videos"]:
 #                 yt_url = video["url"]
 #                 for clip in video["vidclips"]:
-#                     futures.append(executor.submit(task, character, yt_url, clip))
+#                     future = executor.submit(task, character, yt_url, clip)
+#                     futures.append(future)
+#                     clip_context_map[future] = (character, yt_url)
 
 #         completed_count = 0
+#         failed_clips = []
+
 #         for future in concurrent.futures.as_completed(futures):
+#             character, yt_url = clip_context_map[future]
 #             try:
-#                 result = future.result(timeout=180)  # timeout in case of hanging task
-#                 if result:
+#                 result = future.result(timeout=180)
+#                 if result and "path" in result:
 #                     downloaded_media.append(result)
 #                     completed_count += 1
+#                 else:
+#                     failed_clips.append(result)
 #             except Exception as e:
-#                 logging.error(f"⛔ Future task failed: {e}")
-#                 continue
+#                 logging.error(f"⛔ Future task failed for {character} - URL: {yt_url} | Exception: {e}")
+#                 failed_clips.append({"character": character, "url": yt_url, "error": str(e)})
 
 #     logging.info(f"✅ Completed {completed_count}/{len(futures)} video clips successfully.")
 
-#     if completed_count != len(futures):
-#         raise RuntimeError(f"{len(futures) - completed_count} video segments failed to download after retries.")
+#     if failed_clips:
+#         logging.error(f"❌ {len(failed_clips)} clip(s) failed:")
+#         for fail in failed_clips:
+#             logging.error(f"   Character: {fail.get('character')} | URL: {fail.get('url')} | Error: {fail.get('error')}")
+
+#     # if completed_count != len(futures):
+#     #     raise RuntimeError(f"{len(futures) - completed_count} video segments failed to download after retries.")
 
 #     return downloaded_media
 
-import os
-import time
-import logging
-import concurrent.futures
 
-def download_video_clips_in_parallel(clip_data_list, section_dir,user_id, max_workers=4, max_retries=5):
+from pathlib import Path
+from collections import defaultdict
+import hashlib, threading, concurrent.futures, shutil
+
+SOURCE_CACHE_DIR = Path(os.environ.get("VIDEO_SOURCE_CACHE", "cache/source_videos"))
+SOURCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LONG_VIDEO_THRESHOLD_SEC = 600
+_source_locks, _source_locks_guard = {}, threading.Lock()
+# Grok/NVENC segment cuts share one GPU — parallel writes also raced on identical output names.
+_grok_nvenc_cut_sem = threading.Semaphore(
+    max(1, int(os.environ.get("GROK_CUT_NVENC_PARALLEL", "2")))
+)
+
+def _find_js_runtime(name: str, win_fallbacks: tuple[str, ...] = ()) -> str | None:
+    """Locate deno/node on PATH or common Windows install dirs (no env vars)."""
+    path = shutil.which(name)
+    if path:
+        return path
+    for candidate in win_fallbacks:
+        expanded = os.path.expandvars(os.path.expanduser(candidate))
+        if os.path.isfile(expanded):
+            return expanded
+    return None
+
+
+def _js_runtime_opts() -> dict:
+    """
+    YouTube now requires an external JS runtime + EJS scripts (yt-dlp 2025+).
+    Auto-detect Deno (preferred) or Node 22+ — no env configuration.
+    """
+    runtimes: dict = {}
+    deno = _find_js_runtime(
+        "deno",
+        (
+            r"%USERPROFILE%\.deno\bin\deno.exe",
+            r"C:\Program Files\deno\deno.exe",
+            r"C:\Program Files (x86)\deno\deno.exe",
+        ),
+    )
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    node = _find_js_runtime(
+        "node",
+        (
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+        ),
+    )
+    if node:
+        runtimes["node"] = {"path": node}
+    if not runtimes:
+        # yt-dlp default: try deno on PATH
+        runtimes["deno"] = {}
+        logging.warning(
+            "⚠️ No Deno/Node JS runtime found — install Deno for YouTube downloads. "
+            "See https://github.com/yt-dlp/yt-dlp/wiki/EJS"
+        )
+    return runtimes
+
+
+def _ejs_component_opts() -> dict:
+    """Enable EJS challenge solver fetch (GitHub) when yt-dlp-ejs pip package missing."""
+    return {"remote_components": {"ejs:github"}}
+
+
+def _ytdlp_tor_enabled() -> bool:
+    return os.environ.get("YTDLP_TOR_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _ytdlp_fallback_proxy() -> str | None:
+    """
+    Tor/SOCKS proxy used ONLY after a geo-restriction error (not on every download).
+    Set YTDLP_TOR_ENABLED=0 or YTDLP_PROXY=none to disable fallback entirely.
+    """
+    if not _ytdlp_tor_enabled():
+        return None
+    proxy = os.environ.get("YTDLP_PROXY", "socks5://127.0.0.1:9050").strip()
+    if not proxy or proxy.lower() in ("0", "false", "no", "off", "none"):
+        return None
+    return proxy
+
+
+def _is_ytdlp_geo_restricted(exc: BaseException) -> bool:
+    geo_err = getattr(yt_dlp.utils, "GeoRestrictedError", None)
+    if geo_err and isinstance(exc, geo_err):
+        return True
+    dl_err = getattr(yt_dlp.utils, "DownloadError", None)
+    if dl_err and isinstance(exc, dl_err) and getattr(exc, "exc_info", None):
+        inner = exc.exc_info[1]
+        if geo_err and isinstance(inner, geo_err):
+            return True
+    msg = str(exc).lower()
+    return (
+        "not made this video available in your country" in msg
+        or "georestricted" in msg
+        or "geo restricted" in msg
+    )
+
+
+def _ytdlp_rotate_tor_circuit() -> None:
+    """Optional NEWNYM when YTDLP_TOR_NEWNYM=1 and Tor control port is open."""
+    if os.environ.get("YTDLP_TOR_NEWNYM", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    try:
+        from stem import Signal
+        from stem.control import Controller
+
+        control_port = int(os.environ.get("YTDLP_TOR_CONTROL_PORT", "9051"))
+        with Controller.from_port(port=control_port) as controller:
+            controller.authenticate()
+            controller.signal(Signal.NEWNYM)
+        logging.info("🔄 Tor circuit rotated (NEWNYM)")
+        time.sleep(5)
+    except Exception as e:
+        logging.warning(f"⚠️ Tor NEWNYM skipped: {e}")
+
+
+def _ytdlp_run(url: str, opts: dict, *, download: bool = True):
+    """
+    Run yt-dlp direct first. On GeoRestrictedError only, retry once via Tor proxy
+    (YTDLP_PROXY, default socks5://127.0.0.1:9050). Normal clips never use Tor.
+    """
+    proxy = _ytdlp_fallback_proxy()
+
+    def _attempt(use_proxy: bool):
+        run_opts = dict(opts)
+        if use_proxy:
+            run_opts["proxy"] = proxy
+        else:
+            run_opts.pop("proxy", None)
+        with yt_dlp.YoutubeDL(run_opts) as ydl:
+            # extract_info(download=True) downloads exactly like ydl.download()
+            # and also tells us which stream/resolution was picked.
+            return ydl.extract_info(url, download=download)
+
+    try:
+        return _attempt(use_proxy=False)
+    except Exception as e:
+        if not _is_ytdlp_geo_restricted(e) or not proxy:
+            raise
+        logging.warning(
+            f"⚠️ Geo-blocked on direct IP — retrying via Tor ({proxy}): {url[:80]}..."
+        )
+        try:
+            return _attempt(use_proxy=True)
+        except Exception as e2:
+            _ytdlp_rotate_tor_circuit()
+            raise e2
+
+def _url_cache_key(url):
+    return hashlib.sha256(url.encode()).hexdigest()[:20]
+
+def _lock_for(key):
+    with _source_locks_guard:
+        return _source_locks.setdefault(key, threading.Lock())
+
+def _base_ydl_opts(outtmpl, retries=3):
+    """
+    yt-dlp options for YouTube and other extractors.
+    Cookies: live Firefox profile. JS: auto-detected Deno/Node + EJS scripts.
+    """
+    opts = {
+        # Best stream up to 1080p (H.264 preferred: fast decode + NVENC friendly).
+        # The 360p muxed file is only a last resort — see _ytdlp_download_hd.
+        "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+        "format_sort": ["res:1080", "vcodec:h264", "fps", "acodec:m4a"],
+        "outtmpl": outtmpl,
+        "merge_output_format": "mp4",
+        "retries": retries,
+        "fragment_retries": 10,
+        "concurrent_fragment_downloads": 8,
+        "noprogress": True,
+        "cookiesfrombrowser": ("firefox",),
+        "js_runtimes": _js_runtime_opts(),
+    }
+    opts.update(_ejs_component_opts())
+    return opts
+
+
+# ── HD guard ───────────────────────────────────────────────────────────
+# YouTube sometimes withholds the real streams from a player client and only
+# offers the 360p muxed file. Each attempt below is tried until one gives
+# >= YTDLP_MIN_HEIGHT (default 720). (None = yt-dlp's own client choice.)
+_YT_CLIENT_ATTEMPTS = (
+    (None, True),
+    (["web", "mweb", "default"], True),
+    (["tv"], True),
+    (["web_safari"], True),
+    (["android_vr"], False),   # android_vr does not support cookies
+)
+_YT_URL_RE = re.compile(r"(?:youtube\.com|youtu\.be|youtube-nocookie\.com)", re.I)
+
+
+def _ytdlp_min_height() -> int:
+    try:
+        return max(0, int(os.environ.get("YTDLP_MIN_HEIGHT", "720")))
+    except ValueError:
+        return 720
+
+
+def _ytdlp_picked(info) -> dict:
+    info = info or {}
+    fmts = info.get("requested_formats") or [info]
+    v = next((f for f in fmts if f.get("vcodec") not in (None, "none")), fmts[0] if fmts else {})
+    return {
+        "format_id": info.get("format_id"),
+        "width": v.get("width"),
+        "height": v.get("height") or 0,
+        "vcodec": v.get("vcodec"),
+    }
+
+
+def _ytdlp_download_hd(url: str, opts: dict, out_path: str) -> dict:
+    """
+    Download with _ytdlp_run, log the picked resolution, and retry other
+    YouTube player clients when the result is below YTDLP_MIN_HEIGHT.
+    Keeps the best file if no attempt reaches the target. Returns picked info.
+    """
+    min_h = _ytdlp_min_height()
+    attempts = _YT_CLIENT_ATTEMPTS if _YT_URL_RE.search(url or "") else ((None, True),)
+    best = None  # (height, path, picked, label)
+    last_err = None
+    for i, (clients, use_cookies) in enumerate(attempts):
+        run_opts = dict(opts)
+        if clients:
+            run_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        else:
+            run_opts.pop("extractor_args", None)
+        if not use_cookies:
+            run_opts.pop("cookiesfrombrowser", None)
+            run_opts.pop("cookiefile", None)
+        label = ("+".join(clients) if clients else "yt-dlp default") + ("" if use_cookies else " (no cookies)")
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        try:
+            info = _ytdlp_run(url, run_opts, download=True)
+        except Exception as e:
+            last_err = e
+            logging.warning(f"⚠️ yt-dlp [{label}] failed: {str(e).splitlines()[0][:160]}")
+            continue
+        if not os.path.exists(out_path):
+            last_err = RuntimeError("yt-dlp produced no file")
+            continue
+        picked = _ytdlp_picked(info)
+        h = int(picked.get("height") or 0)
+        if not h:
+            try:
+                h = probe_video_size(out_path)[1]
+                picked["height"] = h
+            except Exception:
+                pass
+        logging.info(
+            f"🎞️ yt-dlp picked format {picked.get('format_id')} "
+            f"{picked.get('width') or '?'}x{h or '?'} {picked.get('vcodec') or ''} via {label}"
+        )
+        if best is None or h > best[0]:
+            if best and os.path.exists(best[1]):
+                try:
+                    os.remove(best[1])
+                except OSError:
+                    pass
+            keep = out_path if (h >= min_h or i == len(attempts) - 1) else f"{out_path}.try{i}"
+            if keep != out_path:
+                os.replace(out_path, keep)
+            best = (h, keep, picked, label)
+        if h >= min_h:
+            break
+        if i < len(attempts) - 1:
+            logging.warning(f"⚠️ Only {h}p from {label} — trying another YouTube client for HD")
+    if best is None:
+        raise last_err or RuntimeError(f"yt-dlp download failed: {url}")
+    if best[1] != out_path:
+        os.replace(best[1], out_path)
+    if best[0] and best[0] < min_h:
+        logging.warning(
+            f"⚠️ Best available was {best[0]}p ({best[3]}). "
+            "Run `pip install -U yt-dlp` — old builds lose YouTube's HD streams."
+        )
+    return best[2]
+
+def probe_video_size(input_file):
+    probe = ffmpeg.probe(input_file)
+    s = next(x for x in probe["streams"] if x["codec_type"] == "video")
+    return int(s["width"]), int(s["height"])
+
+def probe_video_duration(input_file):
+    probe = ffmpeg.probe(input_file)
+    s = next(x for x in probe["streams"] if x["codec_type"] == "video")
+    return float(s.get("duration") or probe["format"]["duration"])
+
+def scale_crop_to_input(crop_spec, input_w, input_h):
+    expected = crop_spec.get("expectedInputResolution") or {}
+    ref_w = int(expected.get("width") or input_w)
+    ref_h = int(expected.get("height") or input_h)
+    sx, sy = input_w / ref_w, input_h / ref_h
+    x, y = int(crop_spec["x"] * sx), int(crop_spec["y"] * sy)
+    w, h = int(crop_spec["width"] * sx), int(crop_spec["height"] * sy)
+    w -= w % 2; h -= h % 2
+    x = max(0, min(x, input_w - 2)); y = max(0, min(y, input_h - 2))
+    w = min(w, input_w - x); h = min(h, input_h - y)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"Invalid crop: {x},{y},{w},{h}")
+    return x, y, w, h
+
+def get_video_metadata(url, retries=2):
+    try:
+        from helper.grok_imagine_extractor import (
+            is_grok_imagine_share_link,
+            get_grok_video_metadata,
+        )
+
+        if is_grok_imagine_share_link(url):
+            return get_grok_video_metadata(url)
+    except Exception as e:
+        logging.error(f"❌ Grok metadata failed for {url}: {e}")
+        raise
+
+    for attempt in range(retries):
+        try:
+            opts = _base_ydl_opts("%(id)s")
+            opts["skip_download"] = True
+            opts["ignore_no_formats_error"] = True
+            info = _ytdlp_run(url, opts, download=False)
+            return {"duration": float(info.get("duration") or 0), "title": info.get("title") or ""}
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+def choose_download_strategy(clip_count, duration_sec):
+    if clip_count >= 2:
+        return "cache"
+    return "partial"
+
+def _source_cache_usable(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size < 10_000:
+        return False
+    try:
+        if _probe_stream_duration(str(path), "video") <= 0:
+            return False
+        return _verify_video_decodable(str(path), timeout=90)
+    except Exception:
+        return False
+
+
+def get_or_download_source(url, retries=3):
+    key = _url_cache_key(url)
+    cached = SOURCE_CACHE_DIR / f"{key}.mp4"
+    if _source_cache_usable(cached):
+        return str(cached)
+    if cached.exists():
+        logging.warning(
+            "♻️ Removing bad Grok/source cache (undecodable): %s",
+            cached.name,
+        )
+        try:
+            cached.unlink()
+        except OSError:
+            pass
+    lock = _lock_for(key)
+    with lock:
+        if _source_cache_usable(cached):
+            return str(cached)
+        if cached.exists():
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+        tmp = cached.with_suffix(".part.mp4")
+        try:
+            from helper.grok_imagine_extractor import (
+                is_grok_imagine_share_link,
+                download_grok_imagine_source,
+            )
+
+            if is_grok_imagine_share_link(url):
+                path = download_grok_imagine_source(url, str(tmp))
+                if not path:
+                    raise RuntimeError(f"Grok Imagine download failed: {url}")
+                path_obj = Path(path)
+                if path_obj != cached:
+                    if cached.exists():
+                        cached.unlink()
+                    path_obj.replace(cached)
+                return str(cached)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logging.error(f"❌ Grok source download error: {e}")
+            raise RuntimeError(f"Grok Imagine download failed: {url}") from e
+
+        opts = _base_ydl_opts(str(tmp), retries)
+        _ytdlp_download_hd(url, opts, str(tmp))
+        if not tmp.exists() or tmp.stat().st_size < 10_000:
+            raise RuntimeError(f"Source download failed: {url}")
+        tmp.replace(cached)
+        return str(cached)
+
+def _nvenc_args():
+    return [
+        "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
+        "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+    ]
+
+def _build_filter_graph(crop, effect, logo_path, input_w, input_h):
+    chain = ""
+    if crop and all(k in crop for k in ("x", "y", "width", "height")):
+        x, y, w, h = scale_crop_to_input(crop, input_w, input_h)
+        chain += f"crop={w}:{h}:{x}:{y},"
+    if effect == "zoom":
+        chain += "scale=1.3*iw:1.3*ih,"
+    elif effect == "mirror":
+        chain += "hflip,"
+    elif effect == "zoom+mirror":
+        chain += "scale=1.3*iw:1.3*ih,hflip,"
+    if chain.endswith(","):
+        chain = chain[:-1]
+
+    auto_crop = "" if crop else "crop=h=iw*9/16,"
+    proc = f"[main]{chain}[processed];" if chain else "[main]null[processed];"
+    graph = (
+        "[0:v]split=2[main][blur];"
+        "[blur]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
+        "boxblur=luma_radius=min(h\\,w)/20:luma_power=1:"
+        "chroma_radius=min(cw\\,ch)/20:chroma_power=1[bg];"
+        f"{proc}"
+        "[processed]scale=1920:1080:force_original_aspect_ratio=decrease[scaled];"
+        "[bg][scaled]overlay=(W-w)/2:(H-h)/2,"
+        f"{auto_crop}"
+        "eq=contrast=1.05:saturation=1.15:brightness=0.01[video]"
+    )
+    if logo_path:
+        return graph + ";[video][1:v]overlay=W-w-10:H-h-10[final]", "[final]"
+    return graph, "[video]"
+
+def _unique_clip_output_path(section_dir, character, start, end, clip) -> str:
+    """Every vidclip gets its own file (parallel cuts must not share millis-based names)."""
+    tag = (clip.get("tag") or "").strip()
+    safe_tag = re.sub(r"[^\w.-]+", "_", tag)[:48] if tag else "clip"
+    name = (
+        f"{character}_{start:.2f}_{end:.2f}_{safe_tag}_{uuid.uuid4().hex[:12]}.mp4"
+    )
+    return os.path.join(section_dir, name)
+
+
+def process_segment_single_pass(input_path, output_path, start_time, end_time,
+                                user_id, crop=None, effect=None):
+    """Accurate trim + crop + effects in ONE NVENC pass."""
+    duration = end_time - start_time
+    if duration <= 0:
+        raise ValueError(f"Bad range {start_time}→{end_time}")
+
+    in_w, in_h = probe_video_size(input_path)
+    logo_path = None
+    if user_id == "admin@example.com":
+        logo_path = "branding/admin_logo.png"
+    elif user_id and user_id.endswith("@company.com"):
+        logo_path = "branding/company_logo.png"
+    if logo_path and not os.path.exists(logo_path):
+        logo_path = None
+
+    graph, map_out = _build_filter_graph(crop, effect, logo_path, in_w, in_h)
+
+    # Accurate trim: fast pre-seek + fine post-seek (frame-accurate)
+    pre_seek = max(0.0, start_time - 3.0)
+    fine_seek = start_time - pre_seek
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{pre_seek:.3f}", "-i", input_path,
+        "-ss", f"{fine_seek:.3f}",
+    ]
+    if logo_path:
+        cmd += ["-i", logo_path]
+    cmd += [
+        "-t", f"{duration:.3f}",
+        "-filter_complex", graph,
+        "-map", map_out, "-map", "0:a?",
+        *_nvenc_args(),
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", "-shortest",
+        output_path,
+    ]
+    with _grok_nvenc_cut_sem:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-1500:])
+    if not _verify_video_decodable(output_path, timeout=60):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Grok/NVENC cut produced undecodable file: {output_path}"
+        )
+    return output_path
+
+def crop_with_audio(input_file, output_file, crop_spec):
+    try:
+        in_w, in_h = probe_video_size(input_file)
+        x, y, w, h = scale_crop_to_input(crop_spec, in_w, in_h)
+        cmd = [
+            "ffmpeg", "-y", "-i", input_file,
+            "-filter:v", f"crop={w}:{h}:{x}:{y}",
+            "-map", "0:v:0", "-map", "0:a?",
+            *_nvenc_args(),
+            "-c:a", "aac", "-b:a", "192k",
+            output_file,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr)
+        logging.info(f"✂️ Cropping completed: {output_file}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Cropping failed: {e}")
+        return False
+
+def download_video_segment(user_id, url, output_path, start_time, end_time,
+                           crop=None, effect=None, retries=3):
+    if start_time is None or end_time is None or end_time <= start_time:
+        logging.warning(f"Invalid time range: {start_time}→{end_time}")
+        return None
+
+    try:
+        from helper.grok_imagine_extractor import is_grok_imagine_share_link
+
+        if is_grok_imagine_share_link(url):
+            source_path = get_or_download_source(url)
+            if not source_path:
+                return None
+            process_segment_single_pass(
+                source_path,
+                output_path,
+                start_time,
+                end_time,
+                user_id,
+                crop=crop,
+                effect=effect,
+            )
+            logging.info(f"✅ Grok clip segment created: {output_path}")
+            return output_path
+    except Exception as e:
+        logging.error(f"❌ Grok segment download failed: {e}")
+        return None
+
+    temp_raw = f"{output_path}.{uuid.uuid4()}.raw.mp4"
+
+    # Stream-copy a slightly wider range (no force_keyframes_at_cuts → no CPU
+    # re-encode inside yt-dlp), then cut frame-exactly in the single NVENC pass.
+    pad = 2.0
+    range_start = max(0.0, float(start_time) - pad)
+    range_end = float(end_time) + pad
+
+    for attempt in range(retries):
+        try:
+            ydl_opts = _base_ydl_opts(temp_raw, retries)
+            ydl_opts.update({
+                "quiet": False,
+                "progress_hooks": [progress_hook],
+                "download_ranges": lambda _, __, a=range_start, b=range_end: [
+                    {"start_time": a, "end_time": b}
+                ],
+            })
+
+            _ytdlp_download_hd(url, ydl_opts, temp_raw)
+
+            if not os.path.exists(temp_raw) or os.path.getsize(temp_raw) < 10_000:
+                raise RuntimeError("Partial download empty")
+
+            partial_dur = probe_video_duration(temp_raw)
+            seg_start = float(start_time) - range_start
+            seg_end = min(float(end_time) - range_start, partial_dur)
+            if seg_end - seg_start < 0.05:
+                raise RuntimeError(
+                    f"Downloaded range too short ({partial_dur:.2f}s) for "
+                    f"{start_time}→{end_time}"
+                )
+            process_segment_single_pass(
+                temp_raw, output_path, seg_start, seg_end,
+                user_id, crop=crop, effect=effect,
+            )
+            os.remove(temp_raw)
+            logging.info(f"✅ Video segment created: {output_path}")
+            return output_path
+
+        except Exception as e:
+            logging.error(f"❌ Attempt {attempt + 1}/{retries}: {e}")
+            for p in (temp_raw, output_path):
+                if p and os.path.exists(p):
+                    try: os.remove(p)
+                    except: pass
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return None
+
+def download_video_clips_in_parallel(clip_data_list, section_dir, user_id,
+                                     max_workers=6, max_retries=5):
     os.makedirs(section_dir, exist_ok=True)
-    downloaded_media = []
+    by_url = defaultdict(list)
 
-    def task(character_name, yt_url, vidclip):
-        start = time_to_seconds(vidclip.get("startTime", "0:00:00"))
-        end = time_to_seconds(vidclip.get("endTime", "0:00:05"))
-        effect = vidclip.get("effect", None)
-        crop=vidclip.get('crop',None)
+    for item in clip_data_list or []:
+        char = item["characterName"]
+        for video in item.get("videos") or []:
+            url = video["url"]
+            for clip in video.get("vidclips") or []:
+                by_url[url].append({"character": char, "url": url, "clip": clip})
 
-        filename = f"{character_name}_{start}_{end}_{int(time.time())}.mp4"
-        clip_path = os.path.join(section_dir, filename)
+    if not by_url:
+        return []
+
+    # Metadata + strategy per URL
+    url_meta, url_strategy = {}, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        def _meta_job(url):
+            try:
+                meta = get_video_metadata(url)
+                strategy = choose_download_strategy(len(by_url[url]), meta["duration"])
+                return url, meta, strategy
+            except Exception as e:
+                logging.error(f"❌ YouTube metadata failed for {url}: {e}")
+                return url, {"duration": 0, "title": ""}, "partial"
+
+        for url, meta, strategy in ex.map(_meta_job, by_url.keys()):
+            url_meta[url] = meta
+            url_strategy[url] = strategy
+
+    # Pre-cache sources where 2+ clips share a URL
+    url_source = {}
+    cache_urls = [u for u, s in url_strategy.items() if s == "cache"]
+    if cache_urls:
+        def _cache_job(url):
+            try:
+                return url, get_or_download_source(url)
+            except Exception as e:
+                logging.error(f"❌ YouTube source cache failed for {url}: {e}")
+                return url, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            for url, path in ex.map(_cache_job, cache_urls):
+                url_source[url] = path
+
+    def _one(task):
+        char, url, clip = task["character"], task["url"], task["clip"]
+        start = time_to_seconds(clip.get("startTime", "0:00:00"))
+        end = time_to_seconds(clip.get("endTime", "0:00:05"))
+        crop, effect = clip.get("crop"), clip.get("effect")
+        out = _unique_clip_output_path(section_dir, char, start, end, clip)
 
         for attempt in range(1, max_retries + 1):
             try:
-                downloaded_path = download_video_segment(
-                    user_id,
-                    yt_url,
-                    clip_path,
-                    start,
-                    end,
-                    crop,
-                    effect
-                    
-                )
-                if downloaded_path and os.path.exists(downloaded_path):
-                    return {
-                        "character": character_name,
-                        "path": downloaded_path,
-                        "start": start,
-                        "end": end,
-                        "mute": vidclip.get("mute", False),
-                        "tag": vidclip.get("tag", None),
-                        "url": yt_url
-                    }
+                if url_strategy[url] == "cache":
+                    source_path = url_source.get(url)
+                    if not source_path:
+                        raise RuntimeError(
+                            f"Source unavailable for {url} (download or geo-block failed)"
+                        )
+                    process_segment_single_pass(
+                        source_path, out, start, end, user_id, crop, effect
+                    )
                 else:
-                    raise RuntimeError("Downloaded path is invalid or file does not exist.")
+                    path = download_video_segment(
+                        user_id, url, out, start, end, crop, effect, retries=2
+                    )
+                    if not path:
+                        raise RuntimeError("Partial download failed")
 
+                return {
+                    "character": char, "path": out, "start": start, "end": end,
+                    "mute": clip.get("mute", False), "tag": clip.get("tag"), "url": url,
+                }
             except Exception as e:
-                if attempt < max_retries:
-                    wait = 2 ** attempt
-                    logging.warning(f"🔁 Retry {attempt}/{max_retries} for {character_name} - {yt_url}: {e}. Retrying in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    logging.error(f"❌ Final retry failed for {character_name} - URL: {yt_url} | Error: {e}")
-                    return {
-                        "character": character_name,
-                        "url": yt_url,
-                        "error": str(e)
-                    }
+                if attempt == max_retries:
+                    return {"character": char, "url": url, "error": str(e)}
+                time.sleep(2 ** attempt)
 
-    futures = []
-    clip_context_map = {}  # for tracking what each future corresponds to
+    jobs = []
+    for url, tasks in by_url.items():
+        for t in tasks:
+            jobs.append(t)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for item in clip_data_list:
-            character = item["characterName"]
-            for video in item["videos"]:
-                yt_url = video["url"]
-                for clip in video["vidclips"]:
-                    future = executor.submit(task, character, yt_url, clip)
-                    futures.append(future)
-                    clip_context_map[future] = (character, yt_url)
+    downloaded, failed = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for result in ex.map(_one, jobs):
+            if result.get("path"):
+                downloaded.append(result)
+            else:
+                failed.append(result)
 
-        completed_count = 0
-        failed_clips = []
+    logging.info(f"✅ Completed {len(downloaded)}/{len(jobs)} clips.")
+    if failed:
+        logging.error(
+            f"❌ {len(failed)} clip(s) failed — continuing with {len(downloaded)} clip(s)"
+        )
+        for f in failed:
+            logging.error(f"❌ {f.get('character')} | {f.get('url')} | {f.get('error')}")
+    return downloaded
 
-        for future in concurrent.futures.as_completed(futures):
-            character, yt_url = clip_context_map[future]
-            try:
-                result = future.result(timeout=180)
-                if result and "path" in result:
-                    downloaded_media.append(result)
-                    completed_count += 1
-                else:
-                    failed_clips.append(result)
-            except Exception as e:
-                logging.error(f"⛔ Future task failed for {character} - URL: {yt_url} | Exception: {e}")
-                failed_clips.append({"character": character, "url": yt_url, "error": str(e)})
 
-    logging.info(f"✅ Completed {completed_count}/{len(futures)} video clips successfully.")
-
-    if failed_clips:
-        logging.error(f"❌ {len(failed_clips)} clip(s) failed:")
-        for fail in failed_clips:
-            logging.error(f"   Character: {fail.get('character')} | URL: {fail.get('url')} | Error: {fail.get('error')}")
-
-    # if completed_count != len(futures):
-    #     raise RuntimeError(f"{len(futures) - completed_count} video segments failed to download after retries.")
-
-    return downloaded_media
 
 #I---------------------IMAGE DOWNLOAD FUNCTIONS START---------------------I
 def create_session():
@@ -1527,33 +2367,7 @@ def download_with_selenium(img_url, save_path):
     finally:
         if driver: driver.quit()
 
-# def download_image(img_url, img_path):
-#     """Download an image using enhanced logic, fully compatible with the original function."""
-#     os.makedirs(os.path.dirname(img_path), exist_ok=True)
-#     session = create_session()
 
-#     # Smart clean: Use full URL if img_path has no clear name or extension
-#     input_filename = os.path.basename(img_path)
-#     if not re.search(r'\.(jpg|jpeg|png|gif|webp)$', input_filename, re.I):
-#         filename = unified_clean_filename(img_url, session)
-#     else:
-#         filename = unified_clean_filename(input_filename)
-
-#     # Final path to save image
-#     img_path = os.path.join(os.path.dirname(img_path), filename)
-
-#     # 1. Direct download
-#     result = direct_download(session, img_url, img_path)
-#     if result:
-#         return img_path
-
-#     # 2. Try modified headers
-#     result = download_with_modified_headers(session, img_url, img_path)
-#     if result:
-#         return img_path
-
-#     # 3. Fallback to Selenium
-#     return download_with_selenium(img_url, img_path)
 def download_image(img_url, img_path):
     """Download an image using enhanced logic, fully compatible with the original function."""
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
@@ -1622,17 +2436,6 @@ def cosine_similarity(a, b):
     """Compute cosine similarity between two vectors."""
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
 
-# def encode_image_from_pil(image: Image.Image):
-#     """Encode an image using CLIP from a PIL image."""
-#     try:
-#         inputs = clip_processor(images=image, return_tensors="pt")
-#         with torch.no_grad():
-#             image_features = clip_model.get_image_features(**inputs)
-#         return image_features[0].cpu().numpy()
-#     except Exception as e:
-#         logging.error(f"Error encoding image: {e}")
-#         return np.zeros((512,))  # Fallback vector
-
 def encode_image_from_pil(image: Image.Image):
     """Encode an image using CLIP from a PIL image."""
     try:
@@ -1670,48 +2473,6 @@ def extract_representative_frame(video_clip):
         logging.error(f"Frame extraction error in extract_representative_frame: {e}")
         return None
 
-
-def run_yolo_on_image(pil_image):
-    """Run YOLO on a PIL image and return detected labels."""
-    try:
-        cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-        results = yolo_model(cv_image)
-        labels = set()
-        for result in results:
-            for detection in result.boxes.cls.cpu().numpy():
-                label = yolo_model.names[int(detection)]
-                labels.add(label)
-        
-        # Clear GPU memory after processing
-        clear_gpu_memory()
-
-        return "scene contains: " + ", ".join(labels) if labels else "no significant objects detected"
-    except Exception as e:
-        logging.error(f"Error running YOLO on image: {e}")
-        return "error detecting scene"
-
-def clear_gpu_memory():
-    """Clear GPU memory after processing."""
-    try:
-        torch.cuda.empty_cache()  # Clear cache
-    except Exception as e:
-        logging.error(f"Error clearing GPU memory: {str(e)}")
-
-def evaluate_media(pil_image, narration_text):
-    """Evaluate how well an image matches the narration."""
-    try:
-        image_embedding = encode_image_from_pil(pil_image)
-        text_embedding = encode_text(narration_text)
-        score_image = cosine_similarity(image_embedding, text_embedding)
-
-        scene_description = run_yolo_on_image(pil_image)
-        scene_embedding = encode_text(scene_description)
-        score_scene = cosine_similarity(scene_embedding, text_embedding)
-
-        return (score_image + score_scene) / 2.0
-    except Exception as e:
-        logging.error(f"Error evaluating media: {e}")
-        return 0.0
 
 def time_segments(audio_path, segments):
     """Estimate time boundaries for each segment while skipping empty text segments."""
@@ -1841,22 +2602,76 @@ def time_segments(audio_path, segments):
 logger = logging.getLogger("storyboard")
 
 # --- TRIM-FREE LOADER --------------------------------------------------------
-def _load_storyboard_clip_or_raise(
+def _ffprobe_duration(path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}: {result.stderr[-500:]}")
+    return float(result.stdout.strip())
+
+
+def _validate_storyboard_video(path: str, duration: float) -> None:
+    if not path:
+        raise RuntimeError("Storyboard API returned empty path.")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Storyboard path does not exist: {path}")
+    if os.path.getsize(path) < 1000:
+        raise RuntimeError(f"Storyboard file too small: {path}")
+
+    clip_dur = _ffprobe_duration(path)
+    if clip_dur <= 0.05:
+        raise RuntimeError(f"Storyboard clip has invalid duration: {clip_dur}")
+    if abs(clip_dur - duration) > 0.05:
+        logger.warning(
+            f"[Storyboard] Backend duration {clip_dur:.3f}s != target {duration:.3f}s. "
+            "No trimming applied (by design)."
+        )
+
+
+def _copy_storyboard_to_output(src_path: str, output_path: str) -> str:
+    """Stream-copy storyboard MP4 — skip redundant MoviePy re-encode (P1)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src_path,
+        "-c:v", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg copy failed: {result.stderr[-500:]}")
+    return output_path
+
+
+def _storyboard_video_from_api(
     composite_for_api: str,
     duration: float,
-    split_len: int,
-    fps: int,
-    obj_skip: int,
-    bg_skip: int,
-) -> VideoFileClip:
-    """
-    Calls storyboard_from_api with target_dur_sec and returns a validated clip.
-    NO trimming or padding happens here.
-    """
+    split_len: int | None = None,
+    fps: int | None = None,
+    obj_skip: int | None = None,
+    bg_skip: int | None = None,
+    hold_fraction: float | None = None,
+) -> str:
+    tune = _storyboard_tuning(segment_fps=fps or 30)
+    split_len = split_len if split_len is not None else tune["split_len"]
+    fps = fps if fps is not None else tune["fps"]
+    obj_skip = obj_skip if obj_skip is not None else tune["obj_skip"]
+    bg_skip = bg_skip if bg_skip is not None else tune["bg_skip"]
+    hold_fraction = hold_fraction if hold_fraction is not None else tune["hold_fraction"]
+
     logger.info(
         f"[Storyboard] Request -> img='{composite_for_api}', "
         f"target_dur={duration:.2f}s, split={split_len}, fps={fps}, "
-        f"obj_skip={obj_skip}, bg_skip={bg_skip}"
+        f"obj_skip={obj_skip}, bg_skip={bg_skip}, hold={hold_fraction}"
     )
 
     sb_video_path = storyboard_from_api(
@@ -1866,30 +2681,38 @@ def _load_storyboard_clip_or_raise(
         object_skip_rate=int(obj_skip),
         bg_object_skip_rate=int(bg_skip),
         end_gray_img_duration_in_sec=0,
-        target_dur_sec=duration,          # ✅ tell server the exact target
+        target_dur_sec=duration,
+        hold_fraction=float(hold_fraction),
     )
 
-    if not sb_video_path:
-        raise RuntimeError("Storyboard API returned empty path.")
-    if not os.path.exists(sb_video_path):
-        raise FileNotFoundError(f"Storyboard path does not exist: {sb_video_path}")
-    if os.path.getsize(sb_video_path) == 0:
-        raise RuntimeError(f"Storyboard file is zero bytes: {sb_video_path}")
+    _validate_storyboard_video(sb_video_path, duration)
+    logger.info(f"[Storyboard] OK -> '{sb_video_path}'")
+    return sb_video_path
 
+
+def _load_storyboard_clip_or_raise(
+    composite_for_api: str,
+    duration: float,
+    split_len: int,
+    fps: int,
+    obj_skip: int,
+    bg_skip: int,
+    hold_fraction: float | None = None,
+) -> VideoFileClip:
+    """
+    Calls storyboard API and returns a validated MoviePy clip (legacy composite path).
+    """
+    sb_video_path = _storyboard_video_from_api(
+        composite_for_api=composite_for_api,
+        duration=duration,
+        split_len=split_len,
+        fps=fps,
+        obj_skip=obj_skip,
+        bg_skip=bg_skip,
+        hold_fraction=hold_fraction,
+    )
     clip = VideoFileClip(sb_video_path)
-    if not clip.duration or clip.duration <= 0.05:
-        d = clip.duration
-        clip.close()
-        raise RuntimeError(f"Storyboard clip has invalid duration: {d}")
-
-    # We do NOT trim/pad. Just warn if the backend missed the target.
-    if abs(clip.duration - duration) > 0.05:
-        logger.warning(
-            f"[Storyboard] Backend duration {clip.duration:.3f}s != target {duration:.3f}s. "
-            "No trimming applied (by design)."
-        )
-
-    logger.info(f"[Storyboard] OK -> '{sb_video_path}' ({clip.duration:.2f}s)")
+    logger.info(f"[Storyboard] clip loaded ({clip.duration:.2f}s)")
     return clip
 import os
 import math
@@ -2137,8 +2960,6 @@ def pan_right_to_left_effect(clip, pan_ratio=0.1):
 
 #     return CompositeVideoClip([chosen_clip])
 
-from gpu_kenburns_simple import create_video_gpu_direct
-
 # def create_image_video_with_effects(
 #     image_path: str,
 #     duration: float,
@@ -2363,7 +3184,9 @@ def create_image_video_with_effects(
     effect_override: str = None,
     speed_override: float = None,
     segment_text: str = "",
-    head_freeze_sec: float = 0.0,   # ✅ NEW: seconds to hold first frame before KB starts
+    head_freeze_sec: float = 0.0,
+    video_seed: str = "direct",
+    nvenc_semaphore=None,
 ) -> str:
 
     logger = logging.getLogger(__name__)
@@ -2396,46 +3219,19 @@ def create_image_video_with_effects(
                 composite_path = os.path.splitext(image_path)[0] + f"_resized_{uuid.uuid4()}.jpg"
                 img.resize((canvas_w, canvas_h)).save(composite_path, quality=95)
 
-            sb_clip = _load_storyboard_clip_or_raise(
+            tune = _storyboard_tuning(segment_fps=fps)
+
+            sb_video_path = _storyboard_video_from_api(
                 composite_for_api=composite_path,
                 duration=duration,
-                split_len=10,
-                fps=fps,
-                obj_skip=8,
-                bg_skip=14,
+                split_len=tune["split_len"],
+                fps=tune["fps"],
+                obj_skip=tune["obj_skip"],
+                bg_skip=tune["bg_skip"],
+                hold_fraction=tune["hold_fraction"],
             )
 
-            temp_sb_path = os.path.join(
-                os.path.dirname(output_path), f"temp_sb_{uuid.uuid4()}.mp4"
-            )
-
-            from moviepy.editor import CompositeVideoClip
-            final_sb = CompositeVideoClip([sb_clip.resize((canvas_w, canvas_h))])
-
-            use_nvenc = torch.cuda.is_available()
-            codec  = "h264_nvenc" if use_nvenc else "libx264"
-            preset = "p1" if use_nvenc else "ultrafast"
-
-            final_sb.write_videofile(
-                temp_sb_path,
-                codec=codec,
-                preset=preset,
-                fps=fps,
-                audio=False,
-                threads=4
-            )
-            final_sb.close()
-
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', temp_sb_path,
-                '-c:v', 'copy',
-                '-movflags', 'faststart',
-                output_path
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            os.remove(temp_sb_path)
+            _copy_storyboard_to_output(sb_video_path, output_path)
             os.remove(composite_path)
 
             logger.info(f"✅ Storyboard video created: {output_path}")
@@ -2446,59 +3242,27 @@ def create_image_video_with_effects(
 
     # ============================================================
     # STEP 2: STATIC MODE
-    # head_freeze_sec not relevant here — no KB motion anyway
     # ============================================================
     if not kenburns_enabled:
-        logger.info(f"📸 Static mode - GPU composite + FFmpeg encode")
+        logger.info(f"📸 Static mode")
         try:
-            from gpu_kenburns_simple import create_composite_gpu
-            import numpy as np
-            from PIL import Image
+            from gpu_kenburns_simple import create_static_video_gpu
 
-            composite_tensor = create_composite_gpu(image_path, canvas_w, canvas_h)
-            img_np = composite_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-
-            temp_composite = os.path.join(
-                os.path.dirname(output_path), f"temp_comp_{uuid.uuid4()}.jpg"
+            return create_static_video_gpu(
+                image_path=image_path,
+                duration=duration,
+                width=canvas_w,
+                height=canvas_h,
+                fps=fps,
+                output_path=output_path,
+                nvenc_semaphore=nvenc_semaphore,
             )
-            Image.fromarray(img_np).save(temp_composite, quality=95)
-
-            use_nvenc = torch.cuda.is_available()
-            codec  = "h264_nvenc" if use_nvenc else "libx264"
-            preset = "p1" if use_nvenc else "ultrafast"
-
-            cmd = [
-                'ffmpeg', '-y',
-                '-loop', '1',
-                '-i', temp_composite,
-                '-t', str(duration),
-                '-c:v', codec,
-                '-preset', preset,
-                '-pix_fmt', 'yuv420p',
-                '-r', str(fps),
-                '-movflags', 'faststart',
-                output_path
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"FFmpeg error: {result.stderr[-1000:]}")
-                raise RuntimeError("FFmpeg failed")
-
-            os.remove(temp_composite)
-            logger.info(f"✅ Static video created: {output_path}")
-            return output_path
-
         except Exception as e:
-            logger.error(f"❌ GPU static mode failed: {e}")
+            logger.error(f"❌ Static mode failed: {e}")
             raise
 
     # ============================================================
-    # STEP 3: KEN BURNS — precomputed effect + variable speed
-    # head_freeze_sec passed through to create_video_gpu_direct
-    # which holds first frame still for that duration before
-    # starting KB motion
+    # STEP 3: KEN BURNS — create_video_gpu_direct (ffmpeg default)
     # ============================================================
     from gpu_kenburns_simple import VALID_EFFECTS
 
@@ -2512,6 +3276,8 @@ def create_image_video_with_effects(
     )
 
     try:
+        from gpu_kenburns_simple import create_video_gpu_direct
+
         result_path = create_video_gpu_direct(
             image_path=image_path,
             duration=duration,
@@ -2523,14 +3289,16 @@ def create_image_video_with_effects(
             output_path=output_path,
             segment_text=segment_text,
             speed_multiplier=resolved_speed,
-            head_freeze_sec=head_freeze_sec,  # ✅ NEW
+            head_freeze_sec=head_freeze_sec,
+            video_seed=video_seed,
+            nvenc_semaphore=nvenc_semaphore,
         )
 
         logger.info(f"✅ Ken Burns video created: {result_path}")
         return result_path
 
     except Exception as e:
-        logger.error(f"❌ GPU Ken Burns failed: {e}")
+        logger.error(f"❌ Ken Burns failed: {e}")
         raise
 
 
@@ -3694,7 +4462,6 @@ def generate_script_context(script: str):
     Designed for downstream use in AI image or video generation pipelines.
     """
 
-    # Trim script to first 600 words for context extraction
     trimmed_script = " ".join(script.split()[:600])
 
     system = """
@@ -4594,17 +5361,26 @@ def generate_image_fx_prompts(
     Dynamically reads previous narration and current narration together.
     If the two are semantically related (same character/scene), the prompt continues naturally.
     If not, it resets and generates a fresh scene.
+
+    Space style only: uses layered visual-bible prompt format (see helper.imagefx_styles).
     """
+    from helper.imagefx_styles import generate_space_image_fx_prompts, is_space_style
+
+    if is_space_style(style_spec):
+        return generate_space_image_fx_prompts(
+            text_segment,
+            script_context,
+            prev_segments,
+            client=client,
+            append_style_fn=_append_style_spec,
+            override_prompt=override_prompt,
+        )
 
     if prev_segments is None:
         prev_segments = []
 
-    # Get last 1–2 segments for continuity analysis
     continuity_text = "\n".join(prev_segments[-2:]) if prev_segments else "None — this is the opening scene."
 
-    # ------------------------------
-    # 🎨 STYLE LIBRARY
-    # ------------------------------
     STYLE_LIBRARY = {
         "explanatory": (
     "hand-drawn stick figure illustration with selective splashes of vibrant color; predominantly monochrome graphite "
@@ -4673,6 +5449,7 @@ def generate_image_fx_prompts(
     "noise throughout; clean compositions with thoughtful negative space; consistent medium line weight; "
     "NO TEXT IN IMAGE; versatile style adaptable to any character type or scene with authentic paper texture foundation"
 ),
+
 "fitness_video": (
     "Explanatory scene representation for the text for a fitness video in hand-drawn pencil style featuring cartoonish "
 "gym figures. Depict in predominantly black graphite line art on a clean white background with selective splashes of "
@@ -4778,7 +5555,6 @@ def generate_image_fx_prompts(
         ),
     }
 
-
     style_description = STYLE_LIBRARY.get(style_spec.lower(), style_spec or "")
 
     if override_prompt:
@@ -4786,9 +5562,6 @@ def generate_image_fx_prompts(
     if override_prompts:
        style_description= override_prompts[:1]
 
-    # ------------------------------
-    # 🧠 SYSTEM PROMPT — Semantic Continuity Understanding
-    # ------------------------------
     system = """
 You are a professional cinematic visual designer and story continuity analyst.
 
@@ -4810,9 +5583,6 @@ Rules:
 6. KEEP IT AI IMAGE GENERATOR SAFE (NO PUBLIC UNSAFE PROMPT) SO IMAGE GENERATOR DOES NOT FLAG IT DOES NOT CENSOR IT BREAKING OUR PIPELINE.
 """.strip()
 
-    # ------------------------------
-    # 🎬 USER PROMPT — Context-Aware Scene Logic
-    # ------------------------------
     user = f"""
 PREVIOUS NARRATION:
 {continuity_text}
@@ -4847,16 +5617,13 @@ Focus on concrete, visual elements. Avoid abstract concepts.
 Return ONLY the final scene description — no commentary or reasoning.
 """.strip()
 
-    # ------------------------------
-    # 🔥 MODEL CALL
-    # ------------------------------
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.65,  # keeps consistent continuity decisions
+        temperature=0.65,
     )
 
     prompt = resp.choices[0].message.content.strip()
@@ -5696,10 +6463,10 @@ def refine_prompt_for_safety(unsafe_prompt: str, style_spec: str) -> str:
     """
     Takes a prompt that was rejected as unsafe and refines it to be safe
     while maintaining the artistic style and visual intent.
-    
+
     This is a DEDICATED instance of ChatGPT with ONE JOB: make it safe.
     """
-    
+
     system = """
 You are a prompt safety specialist for AI image generation.
 
@@ -5930,97 +6697,151 @@ def read_imagefx_cookie_file() -> str | None:
         return None
 
 
-# def _handle_401(last_output: str) -> None:
-#     from cookie_timers import cookie_timer  # import the global daemon timer
-#     """
-#     Called whenever ImageFX returns a 401 / UNAUTHENTICATED error.
-#     - Force-rotates the cookie immediately (no waiting for 10-min timer).
-#     - Fires a Telegram alert so you know which cookie index expired.
-#     """
-#     expired_index = cookie_timer.current_index()
-#     logging.warning("🔐 Cookie #%d is expired (401). Force rotating...", expired_index)
-
-#     cookie_timer.force_rotate()
-#     new_index = cookie_timer.current_index()
-#     logging.info("✅ Rotated to cookie index #%d", new_index)
-
-#     if send_telegram_notification:
-#         try:
-#             send_telegram_notification(
-#                 f"🍪 ImageFX Cookie #{expired_index} has expired (401 UNAUTHENTICATED).\n"
-#                 f"Automatically rotated to cookie #{new_index}.\n"
-#                 f"Please update cookies/imagefx_cookies.json if all cookies are exhausted.",
-#                 "Failure",
-#                 "https://www.alchemymix.com/",
-#                 "Fix Cookies"
-#             )
-#         except Exception as e:
-#             logging.error("❌ Failed to send Telegram notification: %s", e)
-
-
-# def _handle_401(last_output: str) -> None:
-#     from cookie_reader import signal_force_rotate
-
-#     logging.warning("🔐 Cookie expired (401). Signalling daemon to force rotate...")
-#     signal_force_rotate()
-#     logging.info("✅ Force rotate signal sent. Daemon will rotate immediately.")
-
-#     try:
-#         send_telegram_notification(
-#             f"🍪 ImageFX Cookie expired (401 UNAUTHENTICATED).\n"
-#             f"Force rotate signal sent to daemon.\n"
-#             f"Please update cookies/imagefx_cookies.json if all cookies are exhausted.",
-#             "Failure",
-#             "https://www.alchemymix.com/",
-#             "Fix Cookies"
-#         )
-#     except Exception as e:
-#         logging.error(f"❌ Failed to send Telegram notification: {e}")
-
-
-
-# -----------------------------------------------------------------------------
-# 1. _handle_401
-# Place this in your imagefx module, replacing the existing _handle_401.
-# Telegram is removed from here entirely — it is now handled by
-# find_best_media_combination which has access to the shared manager dict.
-# _handle_401 only does two things: signals the daemon and logs.
-# -----------------------------------------------------------------------------
-
-
 def _handle_401(last_output: str) -> None:
     """
-    Called when ImageFX returns a 401 / UNAUTHENTICATED response.
-
-    Responsibilities:
-    - Signal the cookie daemon to force-rotate and wait for the new cookie.
-    - Log the event.
-
-    Telegram notification is intentionally NOT sent here because this function
-    runs inside worker processes that have no access to the shared manager dict.
-    Notification with rate-limiting is handled by find_best_media_combination
-    which owns the shared state.
+    Cloudflare worker returned 401. Cookie rotation is legacy — auth is API-key only.
     """
     global _imagefx_auth_failed
     _imagefx_auth_failed = True
-    from cookie_reader import signal_force_rotate
-
-    logging.warning("🔐 ImageFX: 401 / UNAUTHENTICATED detected — waiting for daemon to rotate cookie...")
-    try:
-        success = signal_force_rotate(timeout=15.0)
-        if not success:
-            logging.error("❌ Cookie rotation timed out — next request will likely fail too.")
-    except Exception as e:
-        logging.error(f"❌ Failed to signal force-rotate: {e}")
+    logging.error(
+        "🔐 Cloudflare image worker: 401 Unauthorized — check CLOUDFLARE_IMAGE_API_KEY "
+        f"({last_output})"
+    )
 
 # ─────────────────────────────────────────────
 # Core ImageFX generation function
 # ─────────────────────────────────────────────
+# def _imagefx_generate(
+#     prompt: str,
+#     count: int,
+#     out_dir: str,
+#     cookie: str,
+#     seed: int | None = None,
+#     aspect_hint: str = None,
+#     model: str = "IMAGEN_3_5",
+#     retries: int = 3,
+#     timeout_sec: int = 120,
+# ) -> list[str]:
+#     """
+#     Generate images via the ImageFX CLI.
+#     - Auto-detects orientation from CURRENT_ORIENTATION global if aspect_hint is None.
+#     - On 401, immediately rotates cookie and fires a Telegram alert.
+#     """
+
+#     global CURRENT_ORIENTATION
+
+#     # ── Orientation ──────────────────────────────────────────────────────────
+#     if aspect_hint is None:
+#         if CURRENT_ORIENTATION == "portrait":
+#             aspect_hint = "9:16"
+#         elif CURRENT_ORIENTATION == "landscape":
+#             aspect_hint = "16:9"
+#         else:
+#             aspect_hint = "1:1"
+
+#     size = _normalize_size(aspect_hint)
+
+#     # ── Setup ─────────────────────────────────────────────────────────────────
+#     os.makedirs(out_dir, exist_ok=True)
+#     base_cmd = _resolve_imagefx_cmd()
+
+#     if not cookie or not cookie.strip():
+#         logging.error("❌ ImageFX: cookie is empty or missing.")
+#         return []
+
+#     prompt_flat = _flatten_prompt(prompt)
+#     remaining, all_paths = count, []
+#     batch_index = 0
+#     env = _safe_cookie_env(cookie)
+
+#     while remaining > 0:
+#         this_batch = min(remaining, 8)
+#         base_seed = seed if seed is not None else _stable_seed_from_prompt(prompt_flat)
+#         seed_for_batch = base_seed + (batch_index * 97)
+
+#         cmd = base_cmd + [
+#             "generate",
+#             "--prompt", prompt_flat,
+#             "--model", model,
+#             "--size", size,
+#             "--count", str(this_batch),
+#             "--dir", out_dir,
+#             "--seed", str(seed_for_batch),
+#             "--retry", str(max(1, retries)),
+#             "--cookie", cookie,
+#         ]
+
+#         invocation_attempts = 2
+#         success = False
+#         last_out = ""
+
+#         for attempt in range(1, invocation_attempts + 1):
+#             logging.info(
+#                 "🚀 Running ImageFX (batch %d, attempt %d/%d): %s",
+#                 batch_index + 1, attempt, invocation_attempts,
+#                 " ".join(shlex.quote(c) for c in cmd)
+#             )
+#             try:
+#                 result = subprocess.run(
+#                     cmd,
+#                     check=False,
+#                     stdout=subprocess.PIPE,
+#                     stderr=subprocess.STDOUT,
+#                     text=True,
+#                     env=env,
+#                     timeout=timeout_sec,
+#                 )
+#                 last_out = result.stdout or ""
+
+#                 if result.returncode != 0:
+#                     logging.error(
+#                         "❌ ImageFX generation failed (rc=%s).\n%s",
+#                         result.returncode, last_out[:2000]
+#                     )
+
+#                     # ── 401 handler ──────────────────────────────────────────
+#                     if "401" in last_out or "UNAUTHENTICATED" in last_out:
+#                         _handle_401(last_out)
+#                         # Return empty — caller will retry with fresh cookie
+#                         # on the next generate_image_fx_prompts loop iteration
+#                         return []
+#                     # ─────────────────────────────────────────────────────────
+
+#                 else:
+#                     time.sleep(0.3)
+#                     files = _list_new_images(out_dir)
+#                     new_files = [f for f in files if f not in all_paths][:this_batch]
+#                     if new_files:
+#                         all_paths.extend(new_files)
+#                         success = True
+#                         break
+#                     else:
+#                         logging.warning(
+#                             "⚠️ ImageFX reported success but no image files found in %s", out_dir
+#                         )
+
+#             except subprocess.TimeoutExpired:
+#                 logging.error("⏳ ImageFX CLI timed out after %ss.", timeout_sec)
+#             except Exception as e:
+#                 logging.exception("💥 Failed to invoke ImageFX CLI: %s", e)
+
+#             time.sleep(0.5)
+
+#         if not success:
+#             logging.error("❌ ImageFX: no images generated for this batch after retries.")
+#             break
+
+#         remaining -= this_batch
+#         batch_index += 1
+
+#     return all_paths[:count]
+
+
 def _imagefx_generate(
     prompt: str,
     count: int,
     out_dir: str,
-    cookie: str,
+    cookie: str | None = None,
     seed: int | None = None,
     aspect_hint: str = None,
     model: str = "IMAGEN_3_5",
@@ -6028,9 +6849,8 @@ def _imagefx_generate(
     timeout_sec: int = 120,
 ) -> list[str]:
     """
-    Generate images via the ImageFX CLI.
-    - Auto-detects orientation from CURRENT_ORIENTATION global if aspect_hint is None.
-    - On 401, immediately rotates cookie and fires a Telegram alert.
+    Generate images via the Cloudflare Workers AI endpoint (Bearer API key).
+    Legacy ``cookie`` param is ignored — kept for call-site compatibility only.
     """
 
     global CURRENT_ORIENTATION
@@ -6044,78 +6864,72 @@ def _imagefx_generate(
         else:
             aspect_hint = "1:1"
 
-    size = _normalize_size(aspect_hint)
+    # ── Map aspect ratio to dimensions ────────────────────────────────────────
+    size_map = {
+        "9:16":  (768, 1344),
+        "16:9":  (1344, 768),
+        "1:1":   (1024, 1024),
+    }
+    width, height = size_map.get(aspect_hint, (1024, 1024))
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     os.makedirs(out_dir, exist_ok=True)
-    base_cmd = _resolve_imagefx_cmd()
 
-    if not cookie or not cookie.strip():
-        logging.error("❌ ImageFX: cookie is empty or missing.")
-        return []
+    WORKER_URL = os.getenv(
+        "CLOUDFLARE_IMAGE_WORKER_URL",
+        "https://alchemy-mix.techwebdev3.workers.dev",
+    )
+    API_KEY = os.getenv("CLOUDFLARE_IMAGE_API_KEY", "alchemy-mix#44@245")
 
     prompt_flat = _flatten_prompt(prompt)
     remaining, all_paths = count, []
     batch_index = 0
-    env = _safe_cookie_env(cookie)
 
     while remaining > 0:
         this_batch = min(remaining, 8)
-        base_seed = seed if seed is not None else _stable_seed_from_prompt(prompt_flat)
-        seed_for_batch = base_seed + (batch_index * 97)
-
-        cmd = base_cmd + [
-            "generate",
-            "--prompt", prompt_flat,
-            "--model", model,
-            "--size", size,
-            "--count", str(this_batch),
-            "--dir", out_dir,
-            "--seed", str(seed_for_batch),
-            "--retry", str(max(1, retries)),
-            "--cookie", cookie,
-        ]
-
-        invocation_attempts = 2
         success = False
-        last_out = ""
 
-        for attempt in range(1, invocation_attempts + 1):
+        for attempt in range(1, retries + 1):
             logging.info(
-                "🚀 Running ImageFX (batch %d, attempt %d/%d): %s",
-                batch_index + 1, attempt, invocation_attempts,
-                " ".join(shlex.quote(c) for c in cmd)
+                "🚀 Running ImageFX (batch %d, attempt %d/%d): POST %s",
+                batch_index + 1, attempt, retries, WORKER_URL
             )
             try:
-                result = subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    env=env,
+                response = requests.post(
+                    WORKER_URL,
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "prompt": prompt_flat,
+                        "width":  width,
+                        "height": height,
+                    },
                     timeout=timeout_sec,
                 )
-                last_out = result.stdout or ""
 
-                if result.returncode != 0:
+                if response.status_code == 401:
+                    logging.error("❌ ImageFX: 401 Unauthorized.")
+                    _handle_401("401 UNAUTHENTICATED")
+                    return []
+
+                if response.status_code != 200:
                     logging.error(
                         "❌ ImageFX generation failed (rc=%s).\n%s",
-                        result.returncode, last_out[:2000]
+                        response.status_code, response.text[:2000]
                     )
 
-                    # ── 401 handler ──────────────────────────────────────────
-                    if "401" in last_out or "UNAUTHENTICATED" in last_out:
-                        _handle_401(last_out)
-                        # Return empty — caller will retry with fresh cookie
-                        # on the next generate_image_fx_prompts loop iteration
-                        return []
-                    # ─────────────────────────────────────────────────────────
-
                 else:
+                    # ── Save image to disk ────────────────────────────────────
+                    timestamp = int(time.time() * 1000)
+                    filename  = os.path.join(out_dir, f"image_{timestamp}_{batch_index}_{attempt}.jpg")
+                    with open(filename, "wb") as f:
+                        f.write(response.content)
+
                     time.sleep(0.3)
-                    files = _list_new_images(out_dir)
-                    new_files = [f for f in files if f not in all_paths][:this_batch]
+                    new_files = [filename] if os.path.exists(filename) else []
+
                     if new_files:
                         all_paths.extend(new_files)
                         success = True
@@ -6125,7 +6939,7 @@ def _imagefx_generate(
                             "⚠️ ImageFX reported success but no image files found in %s", out_dir
                         )
 
-            except subprocess.TimeoutExpired:
+            except requests.Timeout:
                 logging.error("⏳ ImageFX CLI timed out after %ss.", timeout_sec)
             except Exception as e:
                 logging.exception("💥 Failed to invoke ImageFX CLI: %s", e)
@@ -6140,6 +6954,24 @@ def _imagefx_generate(
         batch_index += 1
 
     return all_paths[:count]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # def find_best_media_combination(media_pool, segment, character_name, duration_needed, used_media_dict, media_lock, mode, segment_index,script_context,prev_segments=None):
 #     def loop_tagged_media(tagged_media, duration_needed):
@@ -7475,24 +8307,14 @@ _imagefx_auth_failed = False
 # =============================================================================
 def _handle_401(last_output: str) -> None:
     """
-    Called when ImageFX returns a 401 / UNAUTHENTICATED response.
-    Only responsibilities:
-      - Signal the cookie daemon to force-rotate.
-      - Set the module-level auth flag so the caller can detect a 401
-        vs any other empty return from _imagefx_generate.
-    Telegram and all shared-state management live in find_best_media_combination
-    which owns the manager dict.
+    Cloudflare worker returned 401. Cookie rotation is legacy — auth is API-key only.
     """
     global _imagefx_auth_failed
     _imagefx_auth_failed = True
-
-    from cookie_reader import signal_force_rotate
-    logging.warning("🔐 ImageFX: 401 / UNAUTHENTICATED — signalling daemon to force-rotate cookie.")
-    try:
-        signal_force_rotate()
-        logging.info("✅ Force-rotate signal sent to daemon.")
-    except Exception as e:
-        logging.error(f"❌ Failed to signal force-rotate: {e}")
+    logging.error(
+        "🔐 Cloudflare image worker: 401 Unauthorized — check CLOUDFLARE_IMAGE_API_KEY "
+        f"({last_output})"
+    )
 
 
 # =============================================================================
@@ -7562,7 +8384,7 @@ def find_best_media_combination(
             media_dur  = media.get("duration", DEFAULT_IMAGE_DURATION if media["type"] == "image" else 0)
             dur_to_use = min(media_dur, duration_needed - total)
             looped.append({"media": media, "duration": dur_to_use, "has_audio": False})
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:loop_tag"):
                 used_media_dict[media["path"]] = True
             total += dur_to_use
             i     += 1
@@ -7601,7 +8423,7 @@ def find_best_media_combination(
         used_media_dict["_imagefx_401_first_seen_at"] = 0
 
     # ── Pexels ID set initialisation ─────────────────────────────────────────
-    with media_lock:
+    with media_lock_guard(media_lock, f"seg{segment_index}:pexels_init"):
         if "_pexels_downloaded_ids" not in used_media_dict:
             used_media_dict["_pexels_downloaded_ids"] = set()
     downloaded_pexels_ids = used_media_dict["_pexels_downloaded_ids"]
@@ -7671,7 +8493,7 @@ def find_best_media_combination(
                     if os.path.exists(path):
                         os.remove(path)
                     continue
-                with media_lock:
+                with media_lock_guard(media_lock, f"seg{segment_index}:pexels_vid_id"):
                     downloaded_pexels_ids.add(video.get("id"))
                 temp_media_pool.append({
                     "path": path, "type": "video",
@@ -7702,7 +8524,7 @@ def find_best_media_combination(
         for m in available:
             if len(selected) >= media_count:
                 break
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:pexels_vid_mark"):
                 used_media_dict[m["path"]] = True
             selected.append({"media": m, "duration": 0, "has_audio": False})
         if len(selected) < media_count:
@@ -7777,7 +8599,7 @@ def find_best_media_combination(
                     if os.path.exists(path):
                         os.remove(path)
                     continue
-                with media_lock:
+                with media_lock_guard(media_lock, f"seg{segment_index}:pexels_img_id"):
                     downloaded_pexels_ids.add(image.get("id"))
                 temp_media_pool.append({
                     "path": path, "type": "image",
@@ -7808,7 +8630,7 @@ def find_best_media_combination(
         for m in available:
             if len(selected) >= media_count:
                 break
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:pexels_vid_mark"):
                 used_media_dict[m["path"]] = True
             selected.append({"media": m, "duration": DEFAULT_IMAGE_DURATION, "has_audio": False})
         if len(selected) < media_count:
@@ -7845,8 +8667,6 @@ def find_best_media_combination(
     # =========================================================================
     if segment.get("imagefx_required", True) and mode == "original":
 
-        from cookie_reader import read_active_cookie
-
         # Cache keys — all stored in shared manager dict
         prompt_cache_key  = f"_imagefx_prompt_{segment_index}"
         refined_cache_key = f"_imagefx_refined_prompt_{segment_index}"
@@ -7860,7 +8680,7 @@ def find_best_media_combination(
             known_styles = {
                 "ghibli", "explanatory", "explanatory_dark", "chalk",
                 "explanatory_illustrated", "fitness_video", "war", "cinematic",
-                "dark_story", "luxury_motivation", "female_chalk",
+                "dark_story", "luxury_motivation", "female_chalk", "space",
             }
             style_spec      = prompt_text.lower() if prompt_text.lower() in known_styles else style_spec
             override_prompt = prompt_text          if prompt_text.lower() not in known_styles else None
@@ -7868,7 +8688,7 @@ def find_best_media_combination(
         # ── PROMPT CACHE ─────────────────────────────────────────────────────
         # OpenAI is called exactly once per segment regardless of how many
         # retries occur. Prompt is written BEFORE any generation attempt.
-        with media_lock:
+        with media_lock_guard(media_lock, f"seg{segment_index}:prompt_cache_read"):
             cached_prompts = used_media_dict.get(prompt_cache_key)
 
         if cached_prompts:
@@ -7883,11 +8703,11 @@ def find_best_media_combination(
                 style_spec=style_spec,
                 override_prompt=override_prompt,
             )
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:prompt_cache_write"):
                 used_media_dict[prompt_cache_key] = prompts
             logging.info(f"✅ Segment {segment_index}: prompt cached.")
 
-        with media_lock:
+        with media_lock_guard(media_lock, f"seg{segment_index}:image_cache"):
             image_cache = used_media_dict.setdefault("_imagefx_cache_multi", {})
 
         selected_paths: list[str] = []
@@ -7897,7 +8717,7 @@ def find_best_media_combination(
 
             # Check image cache first
             path_from_cache = None
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:cache_lookup"):
                 for cand in image_cache.get(original_prompt, []):
                     if cand not in used_media_dict:
                         used_media_dict[cand] = True
@@ -7912,10 +8732,9 @@ def find_best_media_combination(
             out_dir = os.path.join("imagefx_images", f"{uuid.uuid4().hex}_{prompt_idx:02d}")
 
             # Resume from last refined prompt if one exists, else use original
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:refined_prompt"):
                 current_prompt = used_media_dict.get(refined_cache_key, original_prompt)
 
-            cookie    = read_active_cookie()
             new_paths = None
             attempt   = 0
             max_attempts = 4
@@ -7923,211 +8742,44 @@ def find_best_media_combination(
             while attempt < max_attempts and not new_paths:
                 attempt += 1
                 logging.info(
-                    f"🎬 Segment {segment_index} — ImageFX attempt {attempt}/{max_attempts} "
+                    f"🎬 Segment {segment_index} — Cloudflare image attempt {attempt}/{max_attempts} "
                     f"(prompt: {current_prompt[:60]}...)"
                 )
 
-                if not cookie:
-                    logging.warning(f"⚠️  Segment {segment_index}: no cookie — entering wait loop immediately.")
-                else:
-                    # Reset per-call flag before invoking so we can detect
-                    # whether THIS call produced a 401
-                    global _imagefx_auth_failed
-                    _imagefx_auth_failed = False
+                global _imagefx_auth_failed
+                _imagefx_auth_failed = False
 
-                    new_paths = _imagefx_generate(
-                        prompt=current_prompt,
-                        count=1,
-                        out_dir=out_dir,
-                        cookie=cookie,
-                        seed=seed_i,
-                    )
-
-                    if new_paths:
-                        # ── SUCCESS ──────────────────────────────────────────
-                        # Promote winning prompt to main cache, clear refined cache
-                        with media_lock:
-                            used_media_dict[prompt_cache_key] = [current_prompt]
-                            if refined_cache_key in used_media_dict:
-                                del used_media_dict[refined_cache_key]
-                        break
-
-                    if not _imagefx_auth_failed:
-                        # ── NON-AUTH FAILURE (safety/graphic content block) ──
-                        # Refine prompt, persist immediately, retry
-                        if attempt < max_attempts:
-                            logging.warning(
-                                f"⚠️  Segment {segment_index}: generation failed (non-auth, "
-                                f"likely safety block) on attempt {attempt}. Refining prompt..."
-                            )
-                            logging.info(f"🔍 Current: {current_prompt[:100]}...")
-                            current_prompt = refine_prompt_for_safety(current_prompt, style_spec)
-                            logging.info(f"🛡️  Refined: {current_prompt[:100]}...")
-                            with media_lock:
-                                used_media_dict[refined_cache_key] = current_prompt
-                        continue  # retry with refined prompt
-
-                # ── 401 / UNAUTHENTICATED — enter blocking wait loop ──────────
-                # Cache current prompt state (may be refined) so when cookie
-                # is restored we resume exactly from here with no OpenAI call.
-                now = time.time()
-                with media_lock:
-                    used_media_dict[refined_cache_key]   = current_prompt
-                    used_media_dict["_imagefx_auth_failed"] = True
-                    should_notify, failure_count, first_seen_at = \
-                        _update_401_counters_and_check_notify(now)
-
-                elapsed = int(now - first_seen_at)
-
-                if should_notify:
-                    logging.error(
-                        f"🔑 Segment {segment_index}: ImageFX 401 — pausing all ImageFX workers. "
-                        f"Occurrence #{failure_count}, active {elapsed}s."
-                    )
-                    _send_telegram_safe(
-                        f"🍪 ImageFX Cookie expired (401 UNAUTHENTICATED)\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚠️  Occurrences:  {failure_count}\n"
-                        f"⏱  Active for:   {elapsed}s\n"
-                        f"🔁 Force-rotate signal sent to daemon.\n"
-                        f"⏸  All ImageFX workers paused — waiting for valid cookie...\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Please update cookies/imagefx_cookies.json "
-                        f"if all cookies are exhausted.",
-                        "Failure", "https://www.alchemymix.com/", "Fix Cookies",
-                    )
-                else:
-                    logging.warning(
-                        f"⏸  Segment {segment_index}: 401 detected — waiting for valid cookie "
-                        f"(occurrence #{failure_count}, notification suppressed, "
-                        f"next in ~{int(IMAGEFX_401_NOTIFY_INTERVAL_SEC - (now - used_media_dict.get('_imagefx_401_last_notified_at', 0)))}s)."
-                    )
-
-                # ── POLL LOOP ─────────────────────────────────────────────────
-                logging.warning(
-                    f"⏳ Segment {segment_index}: entering cookie wait loop "
-                    f"(poll every {POLL_INTERVAL_SEC}s, timeout {WAIT_TIMEOUT_SEC}s)..."
+                new_paths = _imagefx_generate(
+                    prompt=current_prompt,
+                    count=1,
+                    out_dir=out_dir,
+                    seed=seed_i,
                 )
 
-                wait_start = time.time()
-                recovered  = False
-
-                while time.time() - wait_start < WAIT_TIMEOUT_SEC:
-                    time.sleep(POLL_INTERVAL_SEC)
-
-                    # Send periodic reminders while waiting
-                    now_poll = time.time()
-                    with media_lock:
-                        still_failed = used_media_dict.get("_imagefx_auth_failed", True)
-
-                    # Another worker may have already recovered
-                    if not still_failed:
-                        logging.info(
-                            f"✅ Segment {segment_index}: auth flag cleared by another worker — resuming."
-                        )
-                        cookie    = read_active_cookie()
-                        recovered = True
-                        break
-
-                    # Periodic Telegram reminder while still waiting
-                    with media_lock:
-                        last_notified_poll = used_media_dict.get("_imagefx_401_last_notified_at", 0)
-                        should_remind      = (now_poll - last_notified_poll) >= IMAGEFX_401_NOTIFY_INTERVAL_SEC
-                        if should_remind:
-                            used_media_dict["_imagefx_401_last_notified_at"] = now_poll
-                            reminder_count    = used_media_dict.get("_imagefx_401_count", failure_count)
-                            reminder_elapsed  = int(now_poll - used_media_dict.get("_imagefx_401_first_seen_at", now))
-
-                    if should_remind:
-                        logging.warning(
-                            f"⏳ Segment {segment_index}: still waiting for valid cookie "
-                            f"({reminder_elapsed}s elapsed, occurrence #{reminder_count})."
-                        )
-                        _send_telegram_safe(
-                            f"⏳ ImageFX Still Waiting for Valid Cookie\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"⚠️  Occurrences:  {reminder_count}\n"
-                            f"⏱  Active for:   {reminder_elapsed}s\n"
-                            f"⏸  All ImageFX workers still paused.\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"Please update cookies/imagefx_cookies.json.",
-                            "Waiting", "https://www.alchemymix.com/", "Fix Cookies",
-                        )
-
-                    # Try fresh cookie
-                    fresh_cookie = read_active_cookie()
-                    if not fresh_cookie:
-                        logging.debug(
-                            f"⏳ Segment {segment_index}: no cookie yet "
-                            f"({int(time.time() - wait_start)}s elapsed)..."
-                        )
-                        continue
-
-                    # Probe with cached prompt — zero OpenAI calls
-                    logging.info(f"🔍 Segment {segment_index}: fresh cookie found — probing with cached prompt...")
-                    _imagefx_auth_failed = False
-
-                    probe_paths = _imagefx_generate(
-                        prompt=current_prompt,   # cached refined prompt
-                        count=1,
-                        out_dir=out_dir,
-                        cookie=fresh_cookie,
-                        seed=seed_i,
-                    )
-
-                    if _imagefx_auth_failed:
-                        # Still 401 — rotated but all cookies exhausted
-                        logging.warning(
-                            f"⚠️  Segment {segment_index}: probed cookie still 401 "
-                            f"({int(time.time() - wait_start)}s elapsed). Still waiting..."
-                        )
-                        continue
-
-                    # Cookie is valid
-                    cookie    = fresh_cookie
-                    recovered = True
-
-                    if probe_paths:
-                        # Probe succeeded AND gave us an image — use it directly
-                        new_paths = probe_paths
-                        logging.info(
-                            f"✅ Segment {segment_index}: recovered and image obtained from probe "
-                            f"({int(time.time() - wait_start)}s downtime)."
-                        )
-                    else:
-                        # Cookie valid but generation failed (non-auth) — resume retry loop
-                        logging.info(
-                            f"🟡 Segment {segment_index}: cookie valid, generation failed (non-auth) "
-                            f"— resuming retry loop."
-                        )
-
-                    # Clear shared auth flag — all other waiting workers resume
-                    recovery_elapsed = int(time.time() - now)
-                    with media_lock:
-                        _clear_auth_failure_state()
-
-                    _send_telegram_safe(
-                        f"✅ ImageFX Cookie Recovered!\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⏱  Total downtime: {recovery_elapsed}s\n"
-                        f"▶️  All ImageFX workers resuming.",
-                        "Recovery", "https://www.alchemymix.com/", "Cookie Recovered",
-                    )
-                    break  # exit poll loop
-
-                if not recovered:
-                    # Timed out — absolute last resort
-                    logging.error(
-                        f"💀 Segment {segment_index}: cookie wait timed out after "
-                        f"{WAIT_TIMEOUT_SEC}s — giving up on ImageFX for this segment."
-                    )
-                    return []  # triggers Tier 2 / Tier 3 in encode_video_segment_with_retry
-
                 if new_paths:
-                    break  # exit the attempt while-loop, image obtained
+                    with media_lock_guard(media_lock, f"seg{segment_index}:prompt_done"):
+                        used_media_dict[prompt_cache_key] = [current_prompt]
+                        if refined_cache_key in used_media_dict:
+                            del used_media_dict[refined_cache_key]
+                    break
 
-                # Cookie recovered but image not yet obtained — continue attempt loop
-                attempt -= 1  # don't count the probe as a real attempt
+                if _imagefx_auth_failed:
+                    logging.error(
+                        f"❌ Segment {segment_index}: Cloudflare worker returned 401 — "
+                        f"check CLOUDFLARE_IMAGE_API_KEY (no cookie wait; failing fast)."
+                    )
+                    break
+
+                if attempt < max_attempts:
+                    logging.warning(
+                        f"⚠️  Segment {segment_index}: generation failed (non-auth, "
+                        f"likely safety block) on attempt {attempt}. Refining prompt..."
+                    )
+                    logging.info(f"🔍 Current: {current_prompt[:100]}...")
+                    current_prompt = refine_prompt_for_safety(current_prompt, style_spec)
+                    logging.info(f"🛡️  Refined: {current_prompt[:100]}...")
+                    with media_lock_guard(media_lock, f"seg{segment_index}:refined_write"):
+                        used_media_dict[refined_cache_key] = current_prompt
 
             # End of attempt loop
             if not new_paths:
@@ -8137,7 +8789,7 @@ def find_best_media_combination(
                 continue
 
             path = new_paths[0]
-            with media_lock:
+            with media_lock_guard(media_lock, f"seg{segment_index}:image_store"):
                 image_cache.setdefault(current_prompt, []).append(path)
                 used_media_dict[path] = True
             selected_paths.append(path)
@@ -8211,7 +8863,7 @@ def find_best_media_combination(
     for media in available_media:
         if len(selected) >= media_count:
             break
-        with media_lock:
+        with media_lock_guard(media_lock, f"seg{segment_index}:media_select"):
             used_media_dict[media["path"]] = True
         selected.append({
             "media": media, "duration": 0,
@@ -8439,7 +9091,6 @@ import os
 import uuid
 import logging
 import gc
-import torch
 from collections import deque
 from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
 #very very most important b4 overlays
@@ -8825,7 +9476,6 @@ import os
 import uuid
 import logging
 import gc
-import torch
 import ffmpeg
 
 # def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_path, tag,
@@ -9050,18 +9700,592 @@ import ffmpeg
 #         print(f"❌ Error in overlay_avatar_no_audio: {e}")
 #         raise
 
-def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_path, tag,
-                            media_pool=None, character_name=None):
-    """
-    Portrait + landscape aware version.
-    Breaking news / TV broadcast style design.
-    """
+# def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_path, tag,
+#                             media_pool=None, character_name=None):
+#     """
+#     Portrait + landscape aware version.
+#     Breaking news / TV broadcast style design.
+#     """
+#     try:
+#         import os
+#         import logging
+#         import shutil
+#         import tempfile
+#         import ffmpeg
+
+#         global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
+
+#         canvas_w = CURRENT_WIDTH
+#         canvas_h = CURRENT_HEIGHT
+#         is_portrait = (CURRENT_ORIENTATION == "portrait")
+
+#         rendered_paths = []
+#         tmp_dir = None
+
+#         # ------------------------------------------
+#         # 1) Validate background
+#         # ------------------------------------------
+#         if not background_path or not os.path.exists(background_path):
+#             raise FileNotFoundError(f"❌ Background video not found: {background_path}")
+
+#         # ------------------------------------------
+#         # 2) Base clip probe
+#         # ------------------------------------------
+#         probe = ffmpeg.probe(resized_clip)
+#         vstream = next(s for s in probe['streams'] if s.get('codec_type') == 'video')
+#         duration = float(
+#             vstream.get('duration')
+#             or probe.get('format', {}).get('duration')
+#             or 0.0
+#         )
+#         if duration <= 0:
+#             raise ValueError("❌ Could not determine input video duration.")
+
+#         main_input = ffmpeg.input(resized_clip)
+#         main_video = main_input.video
+#         main_audio = main_input.audio
+
+#         # ------------------------------------------
+#         # 3) Background — looped + darkened
+#         # ------------------------------------------
+#         bg = (
+#             ffmpeg.input(background_path, stream_loop=-1, t=duration)
+#             .video
+#             .filter('scale', canvas_w, canvas_h, force_original_aspect_ratio='increase')
+#             .filter('crop', canvas_w, canvas_h)
+#             .filter('colorchannelmixer', rr=0.45, gg=0.45, bb=0.45)  # darker = more contrast
+#             .filter('format', 'yuv420p')
+#         )
+
+#         # ------------------------------------------
+#         # 4) Compute panel size
+#         # ------------------------------------------
+#         orig_w = int(vstream['width'])
+#         orig_h = int(vstream['height'])
+#         aspect = orig_w / orig_h
+
+#         if is_portrait:
+#             max_w, max_h = int(canvas_w * 0.92), int(canvas_h * 0.55)
+#         else:
+#             max_w, max_h = int(canvas_w * 0.83), int(canvas_h * 0.83)
+
+#         if aspect > (max_w / max_h):
+#             panel_w = max_w
+#             panel_h = int(max_w / aspect)
+#         else:
+#             panel_h = max_h
+#             panel_w = int(max_h * aspect)
+
+#         if panel_w % 2: panel_w -= 1
+#         if panel_h % 2: panel_h -= 1
+
+#         panel = (
+#             main_video
+#             .filter('scale', panel_w, panel_h)
+#             .filter('format', 'yuv420p')
+#         )
+
+#         # ------------------------------------------
+#         # 5) FRAME DESIGN
+#         #
+#         #    Layer structure (inside → outside):
+#         #    [content panel]
+#         #    [white inner border - 4px]       ← clean inner edge
+#         #    [black separator - 3px]          ← depth gap
+#         #    [white outer border - 10px]      ← the bold white frame
+#         #    [dark shadow ring - 6px]         ← lifts frame off background
+#         # ------------------------------------------
+
+#         inner_white   = 4
+#         black_sep     = 3
+#         outer_white   = 10
+#         shadow        = 6
+
+#         framed = (
+#             panel
+#             # inner white line
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2,
+#                     h=panel_h + inner_white * 2,
+#                     x=inner_white, y=inner_white,
+#                     color='white')
+#             # black separator gap
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2,
+#                     x=black_sep, y=black_sep,
+#                     color='0x111111')
+#             # bold outer white border — the main frame
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2,
+#                     x=outer_white, y=outer_white,
+#                     color='white')
+#             # dark shadow ring
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
+#                     x=shadow, y=shadow,
+#                     color='0x0A0A0A')
+#         )
+
+#         total_border = (inner_white + black_sep + outer_white + shadow) * 2
+#         framed_w = panel_w + total_border
+#         framed_h = panel_h + total_border
+
+#         # ------------------------------------------
+#         # 6) Position panel — centered on canvas
+#         # ------------------------------------------
+#         pos_x = (canvas_w - framed_w) // 2
+#         pos_y = (canvas_h - framed_h) // 2
+
+#         composed = ffmpeg.overlay(bg, framed, x=pos_x, y=pos_y)
+
+#         # ------------------------------------------
+#         # 7) COMING UP CHYRON — big, bold, unmissable
+#         #
+#         #    Layout:
+#         #
+#         #    ╔═══════════════════════════════════════╗
+#         #    ║  [panel content video plays here]     ║
+#         #    ╠═══════════════════════════════════════╣  ← top accent line (red, 8px)
+#         #    ║                                       ║
+#         #    ║   ▌  COMING UP...                     ║  ← dark strip + red flag + big text
+#         #    ║                                       ║
+#         #    ╚═══════════════════════════════════════╝
+#         #
+#         # ------------------------------------------
+#         if tag == 'intro':
+
+#             # Sizes scale with orientation
+#             chyron_h     = 110 if is_portrait else 90   # tall strip = more presence
+#             accent_bar_h = 8                             # red line above strip
+#             text_size    = 72 if is_portrait else 62     # large, unmissable
+#             flag_w       = 14                            # left red tab width
+#             text_pad_x   = 28                            # text left padding after flag
+
+#             # Y positions
+#             strip_y  = pos_y + framed_h - chyron_h - accent_bar_h
+#             accent_y = strip_y
+#             # Vertically center text inside the strip
+#             text_y   = strip_y + accent_bar_h + ((chyron_h - text_size) // 2) - 4
+
+#             # 1) Full-width dark strip — deep black, strong contrast
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h,
+#                 w=framed_w,
+#                 h=chyron_h,
+#                 color='0x000000EE',   # near-opaque black
+#                 t='fill'
+#             )
+
+#             # 2) Red accent bar — sits on top of dark strip
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=accent_y,
+#                 w=framed_w,
+#                 h=accent_bar_h,
+#                 color='0xFF1A1AFF',   # vivid broadcast red
+#                 t='fill'
+#             )
+
+#             # 3) Red left flag tab — broadcast identity marker
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h,
+#                 w=flag_w,
+#                 h=chyron_h,
+#                 color='0xFF1A1AFF',
+#                 t='fill'
+#             )
+
+#             # 4) White separator line between flag and text
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x + flag_w,
+#                 y=strip_y + accent_bar_h,
+#                 w=3,
+#                 h=chyron_h,
+#                 color='0xFFFFFFCC',
+#                 t='fill'
+#             )
+
+#             # 5) "COMING UP..." — big white bold text with strong shadow
+#             composed = composed.filter(
+#                 'drawtext',
+#                 text='COMING UP...',
+#                 fontsize=text_size,
+#                 fontcolor='white',
+#                 x=pos_x + flag_w + text_pad_x,
+#                 y=text_y,
+#                 fontfile='C:/Windows/Fonts/arialbd.ttf',
+#                 shadowcolor='0x000000CC',
+#                 shadowx=3,
+#                 shadowy=3,
+#                 enable='gte(t,0)'
+#             )
+
+#             # 6) Thin white bottom line — closes the chyron cleanly
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h + chyron_h - 3,
+#                 w=framed_w,
+#                 h=3,
+#                 color='0xFFFFFFAA',
+#                 t='fill'
+#             )
+
+#         # ------------------------------------------
+#         # 8) Audio
+#         # ------------------------------------------
+#         audio = (
+#             main_audio
+#             .filter('aresample', 48000)
+#             .filter('aformat', channel_layouts='stereo')
+#         )
+
+#         # ------------------------------------------
+#         # 9) Encode final
+#         # ------------------------------------------
+#         ffmpeg.output(
+#             composed, audio, output_path,
+#             vcodec='h264_nvenc', acodec='aac',
+#             audio_bitrate='192k', ar=48000, ac=2,
+#             preset='p3', crf=18, r=30,
+#             pix_fmt='yuv420p', movflags='+faststart'
+#         ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+
+#         # ------------------------------------------
+#         # 10) Cleanup
+#         # ------------------------------------------
+#         try:
+#             for p in rendered_paths:
+#                 if p and os.path.exists(p):
+#                     os.remove(p)
+#             if tmp_dir:
+#                 shutil.rmtree(tmp_dir, ignore_errors=True)
+#         except Exception:
+#             pass
+
+#         return output_path
+
+#     except ffmpeg.Error as e:
+#         print("🔴 FFmpeg STDERR:\n", e.stderr.decode() if e.stderr else "")
+#         raise
+
+#     except Exception as e:
+#         print(f"❌ Error in overlay_avatar_no_audio: {e}")
+#         raise
+
+# def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_path, tag,
+#                             media_pool=None, character_name=None):
+#     """
+#     Portrait + landscape aware version.
+#     Breaking news / TV broadcast style design.
+#     Falls back to procedural news gradient if no background video is provided.
+#     """
+#     try:
+#         import os
+#         import logging
+#         import shutil
+#         import tempfile
+#         import ffmpeg
+
+#         global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
+
+#         canvas_w = CURRENT_WIDTH
+#         canvas_h = CURRENT_HEIGHT
+#         is_portrait = (CURRENT_ORIENTATION == "portrait")
+
+#         rendered_paths = []
+#         tmp_dir = None
+
+#         # ------------------------------------------
+#         # 1) Base clip probe
+#         # ------------------------------------------
+#         probe = ffmpeg.probe(resized_clip)
+#         vstream = next(s for s in probe['streams'] if s.get('codec_type') == 'video')
+#         duration = float(
+#             vstream.get('duration')
+#             or probe.get('format', {}).get('duration')
+#             or 0.0
+#         )
+#         if duration <= 0:
+#             raise ValueError("❌ Could not determine input video duration.")
+
+#         main_input = ffmpeg.input(resized_clip)
+#         main_video = main_input.video
+#         main_audio = main_input.audio
+
+#         # ------------------------------------------
+#         # 2) Background — real video or news gradient fallback
+#         # ------------------------------------------
+#         if background_path and os.path.exists(background_path):
+#             bg = (
+#                 ffmpeg.input(background_path, stream_loop=-1, t=duration)
+#                 .video
+#                 .filter('scale', canvas_w, canvas_h, force_original_aspect_ratio='increase')
+#                 .filter('crop', canvas_w, canvas_h)
+#                 .filter('colorchannelmixer', rr=0.45, gg=0.45, bb=0.45)
+#                 .filter('format', 'yuv420p')
+#             )
+#         else:
+#             logging.warning(f"⚠️ Background video not found: {background_path} — using news gradient fallback")
+#             # Procedural broadcast news background via lavfi
+#             # Deep navy base with diagonal geq gradient + vignette
+#             bg = (
+#                 ffmpeg.input(
+#                     f'color=c=0x0A0F1E:size={canvas_w}x{canvas_h}:rate=30:duration=999',
+#                     f='lavfi'
+#                 )
+#                 .video
+#                 .filter('geq',
+#                         r='clip(50-(X/W)*30+(Y/H)*10,10,80)',
+#                         g='clip(70-(X/W)*20+(Y/H)*15,20,90)',
+#                         b='clip(120-(X/W)*30-(Y/H)*20,60,140)')
+#                 .filter('vignette', angle=0.5)
+#                 .filter('format', 'yuv420p')
+#             )
+
+#         # ------------------------------------------
+#         # 3) Compute panel size
+#         # ------------------------------------------
+#         orig_w = int(vstream['width'])
+#         orig_h = int(vstream['height'])
+#         aspect = orig_w / orig_h
+
+#         if is_portrait:
+#             max_w, max_h = int(canvas_w * 0.92), int(canvas_h * 0.55)
+#         else:
+#             max_w, max_h = int(canvas_w * 0.83), int(canvas_h * 0.83)
+
+#         if aspect > (max_w / max_h):
+#             panel_w = max_w
+#             panel_h = int(max_w / aspect)
+#         else:
+#             panel_h = max_h
+#             panel_w = int(max_h * aspect)
+
+#         if panel_w % 2: panel_w -= 1
+#         if panel_h % 2: panel_h -= 1
+
+#         panel = (
+#             main_video
+#             .filter('scale', panel_w, panel_h)
+#             .filter('format', 'yuv420p')
+#         )
+
+#         # ------------------------------------------
+#         # 4) FRAME DESIGN
+#         #
+#         #    Layer structure (inside → outside):
+#         #    [content panel]
+#         #    [white inner border - 4px]       ← clean inner edge
+#         #    [black separator - 3px]          ← depth gap
+#         #    [white outer border - 10px]      ← the bold white frame
+#         #    [dark shadow ring - 6px]         ← lifts frame off background
+#         # ------------------------------------------
+
+#         inner_white = 4
+#         black_sep   = 3
+#         outer_white = 10
+#         shadow      = 6
+
+#         framed = (
+#             panel
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2,
+#                     h=panel_h + inner_white * 2,
+#                     x=inner_white, y=inner_white,
+#                     color='white')
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2,
+#                     x=black_sep, y=black_sep,
+#                     color='0x111111')
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2,
+#                     x=outer_white, y=outer_white,
+#                     color='white')
+#             .filter('pad',
+#                     w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
+#                     h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
+#                     x=shadow, y=shadow,
+#                     color='0x0A0A0A')
+#         )
+
+#         total_border = (inner_white + black_sep + outer_white + shadow) * 2
+#         framed_w = panel_w + total_border
+#         framed_h = panel_h + total_border
+
+#         # ------------------------------------------
+#         # 5) Position panel — centered on canvas
+#         # ------------------------------------------
+#         pos_x = (canvas_w - framed_w) // 2
+#         pos_y = (canvas_h - framed_h) // 2
+
+#         composed = ffmpeg.overlay(bg, framed, x=pos_x, y=pos_y)
+
+#         # ------------------------------------------
+#         # 6) COMING UP CHYRON — big, bold, unmissable
+#         #
+#         #    Layout:
+#         #
+#         #    ╔═══════════════════════════════════════╗
+#         #    ║  [panel content video plays here]     ║
+#         #    ╠═══════════════════════════════════════╣  ← top accent line (red, 8px)
+#         #    ║                                       ║
+#         #    ║   ▌  COMING UP...                     ║  ← dark strip + red flag + big text
+#         #    ║                                       ║
+#         #    ╚═══════════════════════════════════════╝
+#         #
+#         # ------------------------------------------
+#         if tag == 'intro':
+
+#             chyron_h     = 110 if is_portrait else 90
+#             accent_bar_h = 8
+#             text_size    = 72 if is_portrait else 62
+#             flag_w       = 14
+#             text_pad_x   = 28
+
+#             strip_y  = pos_y + framed_h - chyron_h - accent_bar_h
+#             accent_y = strip_y
+#             text_y   = strip_y + accent_bar_h + ((chyron_h - text_size) // 2) - 4
+
+#             # 1) Full-width dark strip
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h,
+#                 w=framed_w,
+#                 h=chyron_h,
+#                 color='0x000000EE',
+#                 t='fill'
+#             )
+
+#             # 2) Red accent bar
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=accent_y,
+#                 w=framed_w,
+#                 h=accent_bar_h,
+#                 color='0xFF1A1AFF',
+#                 t='fill'
+#             )
+
+#             # 3) Red left flag tab
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h,
+#                 w=flag_w,
+#                 h=chyron_h,
+#                 color='0xFF1A1AFF',
+#                 t='fill'
+#             )
+
+#             # 4) White separator line between flag and text
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x + flag_w,
+#                 y=strip_y + accent_bar_h,
+#                 w=3,
+#                 h=chyron_h,
+#                 color='0xFFFFFFCC',
+#                 t='fill'
+#             )
+
+#             # 5) "COMING UP..." text
+#             composed = composed.filter(
+#                 'drawtext',
+#                 text='COMING UP...',
+#                 fontsize=text_size,
+#                 fontcolor='white',
+#                 x=pos_x + flag_w + text_pad_x,
+#                 y=text_y,
+#                 fontfile='C:/Windows/Fonts/arialbd.ttf',
+#                 shadowcolor='0x000000CC',
+#                 shadowx=3,
+#                 shadowy=3,
+#                 enable='gte(t,0)'
+#             )
+
+#             # 6) Thin white bottom line
+#             composed = composed.filter(
+#                 'drawbox',
+#                 x=pos_x,
+#                 y=strip_y + accent_bar_h + chyron_h - 3,
+#                 w=framed_w,
+#                 h=3,
+#                 color='0xFFFFFFAA',
+#                 t='fill'
+#             )
+
+#         # ------------------------------------------
+#         # 7) Audio
+#         # ------------------------------------------
+#         audio = (
+#             main_audio
+#             .filter('aresample', 48000)
+#             .filter('aformat', channel_layouts='stereo')
+#         )
+
+#         # ------------------------------------------
+#         # 8) Encode final
+#         # ------------------------------------------
+#         ffmpeg.output(
+#             composed, audio, output_path,
+#             vcodec='h264_nvenc', acodec='aac',
+#             audio_bitrate='192k', ar=48000, ac=2,
+#             preset='p3', crf=18, r=30,
+#             pix_fmt='yuv420p', movflags='+faststart'
+#         ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+
+#         # ------------------------------------------
+#         # 9) Cleanup
+#         # ------------------------------------------
+#         try:
+#             for p in rendered_paths:
+#                 if p and os.path.exists(p):
+#                     os.remove(p)
+#             if tmp_dir:
+#                 shutil.rmtree(tmp_dir, ignore_errors=True)
+#         except Exception:
+#             pass
+
+#         return output_path
+
+#     except ffmpeg.Error as e:
+#         print("🔴 FFmpeg STDERR:\n", e.stderr.decode() if e.stderr else "")
+#         raise
+
+#     except Exception as e:
+#         print(f"❌ Error in overlay_avatar_no_audio: {e}")
+#         raise
+
+def overlay_avatar_no_audio(
+    resized_clip,
+    avatar_path,
+    background_path,
+    output_path,
+    tag,
+    media_pool=None,
+    character_name=None,
+    talking_heads_mode=False,
+    teaser_config=None,
+):
     try:
         import os
         import logging
-        import shutil
-        import tempfile
         import ffmpeg
+        from helper.teaser_backend import normalize_teaser_config, is_intro_tag, hex_to_ffmpeg_color
 
         global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
 
@@ -9069,23 +10293,14 @@ def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_p
         canvas_h = CURRENT_HEIGHT
         is_portrait = (CURRENT_ORIENTATION == "portrait")
 
-        rendered_paths = []
-        tmp_dir = None
+        cfg = normalize_teaser_config(teaser_config) if teaser_config else None
+        is_intro = is_intro_tag(tag)
 
-        # ------------------------------------------
-        # 1) Validate background
-        # ------------------------------------------
-        if not background_path or not os.path.exists(background_path):
-            raise FileNotFoundError(f"❌ Background video not found: {background_path}")
-
-        # ------------------------------------------
-        # 2) Base clip probe
-        # ------------------------------------------
         probe = ffmpeg.probe(resized_clip)
-        vstream = next(s for s in probe['streams'] if s.get('codec_type') == 'video')
+        vstream = next(s for s in probe["streams"] if s.get("codec_type") == "video")
         duration = float(
-            vstream.get('duration')
-            or probe.get('format', {}).get('duration')
+            vstream.get("duration")
+            or probe.get("format", {}).get("duration")
             or 0.0
         )
         if duration <= 0:
@@ -9095,23 +10310,104 @@ def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_p
         main_video = main_input.video
         main_audio = main_input.audio
 
-        # ------------------------------------------
-        # 3) Background — looped + darkened
-        # ------------------------------------------
-        bg = (
-            ffmpeg.input(background_path, stream_loop=-1, t=duration)
-            .video
-            .filter('scale', canvas_w, canvas_h, force_original_aspect_ratio='increase')
-            .filter('crop', canvas_w, canvas_h)
-            .filter('colorchannelmixer', rr=0.45, gg=0.45, bb=0.45)  # darker = more contrast
-            .filter('format', 'yuv420p')
-        )
+        def _apply_content_look(video_stream):
+            if not is_intro or not cfg:
+                return video_stream
 
-        # ------------------------------------------
-        # 4) Compute panel size
-        # ------------------------------------------
-        orig_w = int(vstream['width'])
-        orig_h = int(vstream['height'])
+            effect = cfg.get("contentEffect", "none")
+            color_mode = cfg.get("colorMode", "color")
+
+            if effect == "grayscale" or color_mode == "grayscale":
+                video_stream = video_stream.filter("hue", s=0)
+            elif color_mode == "sepia":
+                video_stream = video_stream.filter(
+                    "colorchannelmixer",
+                    rr=0.393, rg=0.769, rb=0.189,
+                    gr=0.349, gg=0.686, gb=0.168,
+                    br=0.272, bg=0.534, bb=0.131,
+                )
+            elif effect == "desaturate":
+                desat = float(cfg.get("contentDesaturate", 0.65))
+                sat = max(0.0, 1.0 - desat)
+                video_stream = video_stream.filter("hue", s=sat)
+            elif effect == "contrast":
+                video_stream = video_stream.filter(
+                    "eq", contrast=float(cfg.get("contrast", 1.15))
+                )
+
+            if cfg.get("vignette") or effect == "vignette":
+                video_stream = video_stream.filter("vignette")
+
+            return video_stream
+
+        def _apply_intro_chyron(composed_stream, pos_x=0, framed_w=None, pos_y=0, framed_h=None):
+            if not is_intro:
+                return composed_stream
+
+            from helper.teaser_backend import apply_chyron_to_stream
+
+            return apply_chyron_to_stream(
+                composed_stream,
+                cfg,
+                canvas_w,
+                canvas_h,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                framed_w=framed_w,
+                framed_h=framed_h,
+            )
+
+        # ── TALKING HEADS / FULLSCREEN ──────────────────────────
+        if talking_heads_mode:
+            composed = (
+                main_video
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+                .filter("crop", canvas_w, canvas_h)
+            )
+            composed = _apply_content_look(composed)
+            composed = composed.filter("format", "yuv420p")
+            composed = _apply_intro_chyron(composed)
+
+            audio = (
+                main_audio
+                .filter("aresample", 48000)
+                .filter("aformat", channel_layouts="stereo")
+            )
+
+            ffmpeg.output(
+                composed, audio, output_path,
+                vcodec="h264_nvenc", acodec="aac",
+                audio_bitrate="192k", ar=48000, ac=2,
+                preset="p3", crf=18, r=30,
+                pix_fmt="yuv420p", movflags="+faststart",
+            ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+
+            logging.info(f"✅ Intro teaser encoded (fullscreen): {output_path}")
+            return output_path
+
+        # ── STANDARD PANEL MODE ─────────────────────────────────
+        if background_path and os.path.exists(background_path):
+            bg = (
+                ffmpeg.input(background_path, stream_loop=-1, t=duration)
+                .video
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+                .filter("crop", canvas_w, canvas_h)
+                .filter("colorchannelmixer", rr=0.45, gg=0.45, bb=0.45)
+                .filter("format", "yuv420p")
+            )
+        else:
+            logging.warning(f"⚠️ Background video not found: {background_path} — using navy fallback")
+            bg = (
+                ffmpeg.input(
+                    f"color=c=0x0A0F1E:size={canvas_w}x{canvas_h}:rate=30:duration={round(duration, 4)}",
+                    f="lavfi",
+                )
+                .video
+                .filter("format", "yuv420p")
+            )
+
+        orig_w = int(vstream["width"])
+        orig_h = int(vstream["height"])
         aspect = orig_w / orig_h
 
         if is_portrait:
@@ -9126,212 +10422,55 @@ def overlay_avatar_no_audio(resized_clip, avatar_path, background_path, output_p
             panel_h = max_h
             panel_w = int(max_h * aspect)
 
-        if panel_w % 2: panel_w -= 1
-        if panel_h % 2: panel_h -= 1
+        if panel_w % 2:
+            panel_w -= 1
+        if panel_h % 2:
+            panel_h -= 1
 
-        panel = (
-            main_video
-            .filter('scale', panel_w, panel_h)
-            .filter('format', 'yuv420p')
-        )
+        panel = main_video.filter("scale", panel_w, panel_h)
+        panel = _apply_content_look(panel)
+        panel = panel.filter("format", "yuv420p")
 
-        # ------------------------------------------
-        # 5) FRAME DESIGN
-        #
-        #    Layer structure (inside → outside):
-        #    [content panel]
-        #    [white inner border - 4px]       ← clean inner edge
-        #    [black separator - 3px]          ← depth gap
-        #    [white outer border - 10px]      ← the bold white frame
-        #    [dark shadow ring - 6px]         ← lifts frame off background
-        # ------------------------------------------
-
-        inner_white   = 4
-        black_sep     = 3
-        outer_white   = 10
-        shadow        = 6
-
+        inner_white, black_sep, outer_white, shadow = 4, 3, 10, 6
         framed = (
             panel
-            # inner white line
-            .filter('pad',
-                    w=panel_w + inner_white * 2,
-                    h=panel_h + inner_white * 2,
-                    x=inner_white, y=inner_white,
-                    color='white')
-            # black separator gap
-            .filter('pad',
-                    w=panel_w + inner_white * 2 + black_sep * 2,
-                    h=panel_h + inner_white * 2 + black_sep * 2,
-                    x=black_sep, y=black_sep,
-                    color='0x111111')
-            # bold outer white border — the main frame
-            .filter('pad',
-                    w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2,
-                    h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2,
-                    x=outer_white, y=outer_white,
-                    color='white')
-            # dark shadow ring
-            .filter('pad',
-                    w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
-                    h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2,
-                    x=shadow, y=shadow,
-                    color='0x0A0A0A')
+            .filter("pad", w=panel_w + inner_white * 2, h=panel_h + inner_white * 2, x=inner_white, y=inner_white, color="white")
+            .filter("pad", w=panel_w + inner_white * 2 + black_sep * 2, h=panel_h + inner_white * 2 + black_sep * 2, x=black_sep, y=black_sep, color="0x111111")
+            .filter("pad", w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2, h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2, x=outer_white, y=outer_white, color="white")
+            .filter("pad", w=panel_w + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2, h=panel_h + inner_white * 2 + black_sep * 2 + outer_white * 2 + shadow * 2, x=shadow, y=shadow, color="0x0A0A0A")
         )
 
         total_border = (inner_white + black_sep + outer_white + shadow) * 2
         framed_w = panel_w + total_border
         framed_h = panel_h + total_border
-
-        # ------------------------------------------
-        # 6) Position panel — centered on canvas
-        # ------------------------------------------
         pos_x = (canvas_w - framed_w) // 2
         pos_y = (canvas_h - framed_h) // 2
 
         composed = ffmpeg.overlay(bg, framed, x=pos_x, y=pos_y)
+        composed = _apply_intro_chyron(composed, pos_x=pos_x, framed_w=framed_w, pos_y=pos_y, framed_h=framed_h)
 
-        # ------------------------------------------
-        # 7) COMING UP CHYRON — big, bold, unmissable
-        #
-        #    Layout:
-        #
-        #    ╔═══════════════════════════════════════╗
-        #    ║  [panel content video plays here]     ║
-        #    ╠═══════════════════════════════════════╣  ← top accent line (red, 8px)
-        #    ║                                       ║
-        #    ║   ▌  COMING UP...                     ║  ← dark strip + red flag + big text
-        #    ║                                       ║
-        #    ╚═══════════════════════════════════════╝
-        #
-        # ------------------------------------------
-        if tag == 'intro':
-
-            # Sizes scale with orientation
-            chyron_h     = 110 if is_portrait else 90   # tall strip = more presence
-            accent_bar_h = 8                             # red line above strip
-            text_size    = 72 if is_portrait else 62     # large, unmissable
-            flag_w       = 14                            # left red tab width
-            text_pad_x   = 28                            # text left padding after flag
-
-            # Y positions
-            strip_y  = pos_y + framed_h - chyron_h - accent_bar_h
-            accent_y = strip_y
-            # Vertically center text inside the strip
-            text_y   = strip_y + accent_bar_h + ((chyron_h - text_size) // 2) - 4
-
-            # 1) Full-width dark strip — deep black, strong contrast
-            composed = composed.filter(
-                'drawbox',
-                x=pos_x,
-                y=strip_y + accent_bar_h,
-                w=framed_w,
-                h=chyron_h,
-                color='0x000000EE',   # near-opaque black
-                t='fill'
-            )
-
-            # 2) Red accent bar — sits on top of dark strip
-            composed = composed.filter(
-                'drawbox',
-                x=pos_x,
-                y=accent_y,
-                w=framed_w,
-                h=accent_bar_h,
-                color='0xFF1A1AFF',   # vivid broadcast red
-                t='fill'
-            )
-
-            # 3) Red left flag tab — broadcast identity marker
-            composed = composed.filter(
-                'drawbox',
-                x=pos_x,
-                y=strip_y + accent_bar_h,
-                w=flag_w,
-                h=chyron_h,
-                color='0xFF1A1AFF',
-                t='fill'
-            )
-
-            # 4) White separator line between flag and text
-            composed = composed.filter(
-                'drawbox',
-                x=pos_x + flag_w,
-                y=strip_y + accent_bar_h,
-                w=3,
-                h=chyron_h,
-                color='0xFFFFFFCC',
-                t='fill'
-            )
-
-            # 5) "COMING UP..." — big white bold text with strong shadow
-            composed = composed.filter(
-                'drawtext',
-                text='COMING UP...',
-                fontsize=text_size,
-                fontcolor='white',
-                x=pos_x + flag_w + text_pad_x,
-                y=text_y,
-                fontfile='C:/Windows/Fonts/arialbd.ttf',
-                shadowcolor='0x000000CC',
-                shadowx=3,
-                shadowy=3,
-                enable='gte(t,0)'
-            )
-
-            # 6) Thin white bottom line — closes the chyron cleanly
-            composed = composed.filter(
-                'drawbox',
-                x=pos_x,
-                y=strip_y + accent_bar_h + chyron_h - 3,
-                w=framed_w,
-                h=3,
-                color='0xFFFFFFAA',
-                t='fill'
-            )
-
-        # ------------------------------------------
-        # 8) Audio
-        # ------------------------------------------
         audio = (
             main_audio
-            .filter('aresample', 48000)
-            .filter('aformat', channel_layouts='stereo')
+            .filter("aresample", 48000)
+            .filter("aformat", channel_layouts="stereo")
         )
 
-        # ------------------------------------------
-        # 9) Encode final
-        # ------------------------------------------
         ffmpeg.output(
             composed, audio, output_path,
-            vcodec='h264_nvenc', acodec='aac',
-            audio_bitrate='192k', ar=48000, ac=2,
-            preset='p3', crf=18, r=30,
-            pix_fmt='yuv420p', movflags='+faststart'
+            vcodec="h264_nvenc", acodec="aac",
+            audio_bitrate="192k", ar=48000, ac=2,
+            preset="p3", crf=18, r=30,
+            pix_fmt="yuv420p", movflags="+faststart",
         ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
-
-        # ------------------------------------------
-        # 10) Cleanup
-        # ------------------------------------------
-        try:
-            for p in rendered_paths:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
 
         return output_path
 
     except ffmpeg.Error as e:
         print("🔴 FFmpeg STDERR:\n", e.stderr.decode() if e.stderr else "")
         raise
-
     except Exception as e:
         print(f"❌ Error in overlay_avatar_no_audio: {e}")
         raise
-
 
 import os
 import ffmpeg
@@ -10973,34 +12112,1559 @@ import os
 import subprocess
 import uuid
 
-import torch
 from moviepy.editor import AudioFileClip, VideoFileClip
 
 
-def _gpu_render_with_timeout(render_fn, timeout=3600):
-    """
-    Runs render_fn() in a daemon thread with a timeout.
-    Returns (result, error) — one will be None.
-    If timeout is exceeded, returns (None, TimeoutError).
-    """
-    result_container = {}
-    exception_container = {}
+FFMPEG_SEGMENT_TIMEOUT = int(os.getenv("FFMPEG_SEGMENT_TIMEOUT", "600"))
+FFMPEG_CHUNK_PREP_TIMEOUT = int(os.getenv("FFMPEG_CHUNK_PREP_TIMEOUT", "120"))
+# EBU R128 target for avatar vs clip loudness matching (talking-heads + clips).
+PIPELINE_AUDIO_TARGET_LUFS = float(os.getenv("PIPELINE_AUDIO_TARGET_LUFS", "-16"))
+VIDEO_PROBE_TIMEOUT = int(os.getenv("VIDEO_PROBE_TIMEOUT", "120"))
 
-    def _run():
+
+def _default_nvenc_concurrency():
+    """NVENC session slots — tuned for VRAM; override with NVENC_CONCURRENCY."""
+    env_val = os.getenv("NVENC_CONCURRENCY")
+    if env_val is not None:
+        return max(1, int(env_val))
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if vram_gb >= 14:
+            return 4   # A4000 / 4080 / 16GB class
+        if vram_gb >= 10:
+            return 3
+        if vram_gb >= 6:
+            return 2
+        return 1
+    except Exception:
+        return 3
+
+
+def _default_gpu_concurrent_jobs(kenburns_enabled: bool) -> int:
+    """
+    Max simultaneous GPU jobs (Ken Burns + NVENC share this lock).
+    Delegates to worker_config; Ken Burns-off uses higher NVENC-only cap when set.
+    """
+    from worker_config import get_worker_limits
+
+    limits = get_worker_limits()
+    if not kenburns_enabled:
+        env_val = os.getenv("NVENC_CONCURRENCY")
+        if env_val is not None:
+            return max(1, int(env_val))
+        return min(4, limits.encode_pool_workers // 4)
+    return limits.gpu_concurrent_jobs
+
+
+def _default_kenburns_concurrency():
+    """Ken Burns slots — default 1 (exclusive full GPU). Override with KENBURNS_GPU_CONCURRENCY."""
+    env_val = os.getenv("KENBURNS_GPU_CONCURRENCY")
+    if env_val is not None:
+        return max(1, int(env_val))
+    return 1
+
+
+def _default_nvenc_concurrency_for_job(kenburns_enabled: bool) -> int:
+    if kenburns_enabled:
+        return _default_gpu_concurrent_jobs(True)
+    return _default_nvenc_concurrency()
+
+
+
+def _acquire_gpu_lock(gpu_semaphore, label: str, timeout_sec: int | None = None) -> None:
+    """Log while waiting — with GPU_CONCURRENT_JOBS=1 many workers queue here silently."""
+    if timeout_sec is None:
+        timeout_sec = int(os.getenv("GPU_LOCK_TIMEOUT_SEC", "900"))
+    logging.info(f"⏳ {label}: waiting for GPU slot...")
+    acquired = gpu_semaphore.acquire(timeout=timeout_sec)
+    if not acquired:
+        raise TimeoutError(
+            f"{label}: GPU slot unavailable after {timeout_sec}s "
+            f"(prior worker may have died while holding the lock — restart wsgi.py)"
+        )
+    logging.info(f"🔒 {label}: GPU slot acquired")
+
+
+def _kenburns_needs_gpu_lock() -> bool:
+    from gpu_kenburns_simple import kenburns_uses_gpu_lock
+
+    return kenburns_uses_gpu_lock()
+
+
+@lru_cache(maxsize=1)
+def _segment_rate_args(video_codec) -> list:
+    """
+    Quality settings for segment encodes. Without these NVENC falls back to its
+    low default bitrate (~2 Mbps) — blocky 1080p, especially Ken Burns motion.
+    Constant-quality VBR: same speed, much sharper. Tunable via env.
+    """
+    if "nvenc" in str(video_codec):
+        return [
+            "-tune", "hq", "-rc", "vbr",
+            "-cq", os.getenv("SEGMENT_NVENC_CQ", "19"), "-b:v", "0",
+            "-maxrate", os.getenv("SEGMENT_NVENC_MAXRATE", "20M"),
+            "-bufsize", os.getenv("SEGMENT_NVENC_BUFSIZE", "40M"),
+        ]
+    return ["-crf", os.getenv("SEGMENT_X264_CRF", "18")]
+
+
+def _segment_use_nvenc() -> bool:
+    """
+    Pick NVENC without touching torch during OpenAI/ImageFX (avoids CUDA init per worker).
+    Set USE_NVENC=1 on GPU servers; USE_NVENC=0 on CPU-only boxes.
+    """
+    env = os.getenv("USE_NVENC", "1").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return torch.cuda.is_available()
+
+
+def _default_encode_pool_workers(kenburns_enabled: bool = False) -> int:
+    from worker_config import get_worker_limits
+
+    return get_worker_limits().encode_pool_workers
+
+
+def _uses_nvenc_in_cmd(cmd):
+    return any("nvenc" in str(arg) for arg in cmd)
+
+
+def _ffmpeg_run(cmd, timeout=FFMPEG_SEGMENT_TIMEOUT, label="", nvenc_semaphore=None, uses_nvenc=None):
+    """Run ffmpeg with timeout; limit concurrent NVENC via counting semaphore."""
+    if uses_nvenc is None:
+        uses_nvenc = _uses_nvenc_in_cmd(cmd)
+    if label:
+        logging.debug(f"🎬 FFmpeg start | {label} | timeout={timeout}s")
+
+    def _execute():
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    try:
+        if uses_nvenc and nvenc_semaphore is not None:
+            nvenc_timeout = int(os.getenv("GPU_LOCK_TIMEOUT_SEC", "900"))
+            if not nvenc_semaphore.acquire(timeout=nvenc_timeout):
+                logging.error(
+                    f"⏱️ NVENC slot TIMEOUT ({nvenc_timeout}s) | {label} — "
+                    f"restart wsgi.py if pool is stuck"
+                )
+                return None
+            try:
+                result = _execute()
+            finally:
+                nvenc_semaphore.release()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        else:
+            result = _execute()
+    except subprocess.TimeoutExpired as exc:
+        logging.error(f"⏱️ FFmpeg TIMEOUT ({timeout}s) | {label}")
+        stderr = exc.stderr
+        if stderr:
+            tail = stderr[-500:] if isinstance(stderr, str) else stderr.decode(errors="replace")[-500:]
+            logging.error(f"stderr tail: {tail}")
+        if uses_nvenc and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
+    except Exception as exc:
+        logging.error(f"❌ FFmpeg error | {label}: {exc}")
+        return None
+
+    if label:
+        if result.returncode == 0:
+            logging.debug(f"✅ FFmpeg done | {label}")
+        else:
+            logging.error(
+                f"❌ FFmpeg failed (rc={result.returncode}) | {label}\n"
+                f"{result.stderr[-800:]}"
+            )
+    return result
+
+
+def _probe_video_duration_safe(path, timeout=VIDEO_PROBE_TIMEOUT):
+    """Probe duration without blocking forever on corrupt/huge files."""
+    container = {}
+    error_container = {}
+
+    def _work():
         try:
-            result_container['value'] = render_fn()
-        except Exception as e:
-            exception_container['error'] = e
+            clip = VideoFileClip(path)
+            container["duration"] = clip.duration
+            clip.close()
+            del clip
+        except Exception as exc:
+            error_container["error"] = exc
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
+    probe_thread = threading.Thread(
+        target=_work,
+        name=f"probe-{os.path.basename(path)}",
+        daemon=True,
+    )
+    probe_thread.start()
+    probe_thread.join(timeout)
+    if probe_thread.is_alive():
+        raise TimeoutError(f"VideoFileClip probe timed out after {timeout}s: {path}")
+    if "error" in error_container:
+        raise error_container["error"]
+    return container.get("duration", 0)
 
-    if t.is_alive():
-        return None, TimeoutError(f"GPU render hung after {timeout}s — thread abandoned")
-    if 'error' in exception_container:
-        return None, exception_container['error']
-    return result_container.get('value'), None
+
+def overlay_with_layout(
+    content_path,
+    avatar_path,
+    avatar_start,
+    audio_path,
+    output_path,
+    layout_config,
+    canvas_w,
+    canvas_h,
+):
+    """
+    Three-layer talking heads compositor.
+
+    Layers (bottom to top):
+      1. Background  — dark canvas or blurred content fill
+      2. Content     — main footage scaled to content_layer coords
+      3. Avatar      — talking head scaled to avatar_layer coords
+                       seeked to avatar_start in the batch file
+
+    Layout is driven entirely by layout_config from TalkingHeadsStudio.
+    No hardcoded positions — everything comes from the frontend.
+
+    Handles all layout types:
+      full_avatar    — avatar fills canvas, no content panel
+      full_content   — content fills canvas, no avatar
+      pip_*          — content fills canvas, avatar inset at coords
+      split_*        — both layers side-by-side on dark background
+      center_pip     — content fills canvas, avatar centered
+      news_*         — broadcast style with avatar inset
+    """
+    layout_id     = layout_config.get("layout_id",      "pip_bottom_left")
+    avatar_layer  = layout_config.get("avatar_layer",   None)
+    content_layer = layout_config.get("content_layer",  None)
+
+    use_nvenc   = torch.cuda.is_available()
+    video_codec = "h264_nvenc" if use_nvenc else "libx264"
+    preset_val  = "p5"         if use_nvenc else "medium"
+
+    logging.info(
+        f"🎭 overlay_with_layout | layout={layout_id} | "
+        f"avatar_start={avatar_start:.3f}s | "
+        f"canvas={canvas_w}x{canvas_h}"
+    )
+
+    # ── Validate inputs ───────────────────────────────────────
+    if not os.path.exists(content_path):
+        logging.error(f"❌ overlay_with_layout: content not found: {content_path}")
+        return None
+    if not os.path.exists(avatar_path):
+        logging.error(f"❌ overlay_with_layout: avatar not found: {avatar_path}")
+        return None
+    if not os.path.exists(audio_path):
+        logging.error(f"❌ overlay_with_layout: audio not found: {audio_path}")
+        return None
+
+    # ── Helper: build scale+pad filter for a layer ───────────
+    def _scale_pad(input_label, out_w, out_h, out_label):
+        """Scale input to fit within out_w x out_h, pad to exact size."""
+        return (
+            f"[{input_label}]"
+            f"scale={out_w}:{out_h}:"
+            f"force_original_aspect_ratio=decrease,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1"
+            f"[{out_label}]"
+        )
+
+    def _scale_fill(input_label, out_w, out_h, out_label):
+        """Scale input to fill out_w x out_h (may crop), setsar=1."""
+        return (
+            f"[{input_label}]"
+            f"scale={out_w}:{out_h}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},"
+            f"setsar=1"
+            f"[{out_label}]"
+        )
+
+    try:
+
+        # ════════════════════════════════════════════════════════
+        # CASE 1 — FULL AVATAR
+        # Avatar fills entire canvas. No content panel.
+        # Input 0: avatar   Input 1: audio
+        # ════════════════════════════════════════════════════════
+        if layout_id == "full_avatar" or avatar_layer is None:
+            logging.info(f"🎭 Layout: full_avatar — avatar fills canvas")
+
+            filter_complex = _scale_pad("0:v", canvas_w, canvas_h, "v")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(round(avatar_start, 4)),
+                "-i", avatar_path,     # input 0
+                "-i", audio_path,      # input 1
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "1:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # CASE 2 — FULL CONTENT
+        # Content fills entire canvas. No avatar.
+        # Input 0: content   Input 1: audio
+        # ════════════════════════════════════════════════════════
+        elif layout_id == "full_content" or content_layer is None:
+            logging.info(f"🎭 Layout: full_content — content fills canvas")
+
+            filter_complex = _scale_fill("0:v", canvas_w, canvas_h, "v")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", content_path,    # input 0
+                "-i", audio_path,      # input 1
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "1:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # CASE 3 — PIP / NEWS / CENTER layouts
+        # Content fills canvas as background.
+        # Avatar overlaid at avatar_layer coordinates.
+        # Input 0: content   Input 1: avatar   Input 2: audio
+        # ════════════════════════════════════════════════════════
+        elif layout_id in (
+            "pip_bottom_left",  "pip_bottom_right",
+            "pip_top_left",     "pip_top_right",
+            "pip_bottom_center","pip_top_center",
+            "center_pip",
+            "news_broadcast",   "news_broadcast_br",
+            "news_top_left",    "news_portrait_bottom",
+            "news_portrait_top",
+        ):
+            av_x = avatar_layer["x"]
+            av_y = avatar_layer["y"]
+            av_w = avatar_layer["width"]
+            av_h = avatar_layer["height"]
+
+            logging.info(
+                f"🎭 Layout: {layout_id} | "
+                f"avatar at ({av_x},{av_y}) size {av_w}x{av_h}"
+            )
+
+            filter_complex = ";".join([
+                # Layer 1: content fills canvas
+                _scale_fill("0:v", canvas_w, canvas_h, "bg"),
+                # Layer 2: avatar scaled to layout coords
+                _scale_pad("1:v", av_w, av_h, "av"),
+                # Composite: avatar overlaid on content
+                f"[bg][av]overlay={av_x}:{av_y}[v]",
+            ])
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", content_path,                    # input 0
+                "-ss", str(round(avatar_start, 4)),
+                "-i", avatar_path,                     # input 1 (seeked)
+                "-i", audio_path,                      # input 2
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "2:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # CASE 4 — SPLIT layouts
+        # Both content and avatar occupy separate regions
+        # on a dark background canvas.
+        # Input 0: content   Input 1: avatar   Input 2: audio
+        # ════════════════════════════════════════════════════════
+        elif layout_id in (
+            "split_left",    "split_right",
+            "split_equal",
+            "split_top",     "split_bottom",
+            "split_portrait",
+        ):
+            av_x = avatar_layer["x"]
+            av_y = avatar_layer["y"]
+            av_w = avatar_layer["width"]
+            av_h = avatar_layer["height"]
+
+            ct_x = content_layer["x"]
+            ct_y = content_layer["y"]
+            ct_w = content_layer["width"]
+            ct_h = content_layer["height"]
+
+            logging.info(
+                f"🎭 Layout: {layout_id} | "
+                f"content at ({ct_x},{ct_y}) {ct_w}x{ct_h} | "
+                f"avatar at ({av_x},{av_y}) {av_w}x{av_h}"
+            )
+
+            filter_complex = ";".join([
+                # Dark background
+                f"color=c=#0d0d18:s={canvas_w}x{canvas_h}:r=30[bg]",
+                # Content scaled to its region
+                _scale_pad("0:v", ct_w, ct_h, "ct"),
+                # Avatar scaled to its region
+                _scale_pad("1:v", av_w, av_h, "av"),
+                # Place content on background
+                f"[bg][ct]overlay={ct_x}:{ct_y}[tmp]",
+                # Place avatar on top
+                f"[tmp][av]overlay={av_x}:{av_y}[v]",
+            ])
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", content_path,                    # input 0
+                "-ss", str(round(avatar_start, 4)),
+                "-i", avatar_path,                     # input 1 (seeked)
+                "-i", audio_path,                      # input 2
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "2:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # CASE 5 — CENTER FOCUS
+        # Content fills canvas (used as background).
+        # Avatar centered on top at medium size.
+        # Same filter as PIP but kept separate for clarity.
+        # Input 0: content   Input 1: avatar   Input 2: audio
+        # ════════════════════════════════════════════════════════
+        elif layout_id == "center_focus":
+            av_x = avatar_layer["x"]
+            av_y = avatar_layer["y"]
+            av_w = avatar_layer["width"]
+            av_h = avatar_layer["height"]
+
+            logging.info(
+                f"🎭 Layout: center_focus | "
+                f"avatar at ({av_x},{av_y}) size {av_w}x{av_h}"
+            )
+
+            filter_complex = ";".join([
+                _scale_fill("0:v", canvas_w, canvas_h, "bg"),
+                _scale_pad("1:v", av_w, av_h, "av"),
+                f"[bg][av]overlay={av_x}:{av_y}[v]",
+            ])
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", content_path,
+                "-ss", str(round(avatar_start, 4)),
+                "-i", avatar_path,
+                "-i", audio_path,
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "2:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # CASE 6 — CONTENT MAIN
+        # Content fills canvas, avatar small inset (bottom right).
+        # Coordinates come from layout_config as usual.
+        # Same filter as PIP — content fill + avatar overlay.
+        # Input 0: content   Input 1: avatar   Input 2: audio
+        # ════════════════════════════════════════════════════════
+        elif layout_id == "content_main":
+            av_x = avatar_layer["x"]
+            av_y = avatar_layer["y"]
+            av_w = avatar_layer["width"]
+            av_h = avatar_layer["height"]
+
+            logging.info(
+                f"🎭 Layout: content_main | "
+                f"avatar small inset at ({av_x},{av_y}) {av_w}x{av_h}"
+            )
+
+            filter_complex = ";".join([
+                _scale_fill("0:v", canvas_w, canvas_h, "bg"),
+                _scale_pad("1:v", av_w, av_h, "av"),
+                f"[bg][av]overlay={av_x}:{av_y}[v]",
+            ])
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", content_path,
+                "-ss", str(round(avatar_start, 4)),
+                "-i", avatar_path,
+                "-i", audio_path,
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "2:a:0",
+                "-c:v", video_codec, "-preset", preset_val,
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+        # ════════════════════════════════════════════════════════
+        # FALLBACK — unknown layout_id
+        # Treat as PIP bottom left using avatar_layer coords.
+        # If avatar_layer missing, just scale content to canvas.
+        # ════════════════════════════════════════════════════════
+        else:
+            logging.warning(
+                f"⚠️ overlay_with_layout: unknown layout_id '{layout_id}' "
+                f"— falling back to PIP"
+            )
+
+            if avatar_layer:
+                av_x = avatar_layer["x"]
+                av_y = avatar_layer["y"]
+                av_w = avatar_layer["width"]
+                av_h = avatar_layer["height"]
+
+                filter_complex = ";".join([
+                    _scale_fill("0:v", canvas_w, canvas_h, "bg"),
+                    _scale_pad("1:v", av_w, av_h, "av"),
+                    f"[bg][av]overlay={av_x}:{av_y}[v]",
+                ])
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", content_path,
+                    "-ss", str(round(avatar_start, 4)),
+                    "-i", avatar_path,
+                    "-i", audio_path,
+                    "-filter_complex", filter_complex,
+                    "-map", "[v]",
+                    "-map", "2:a:0",
+                    "-c:v", video_codec, "-preset", preset_val,
+                    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_path,
+                ]
+            else:
+                # No avatar layer at all — just content + audio
+                filter_complex = _scale_fill("0:v", canvas_w, canvas_h, "v")
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", content_path,
+                    "-i", audio_path,
+                    "-filter_complex", filter_complex,
+                    "-map", "[v]",
+                    "-map", "1:a:0",
+                    "-c:v", video_codec, "-preset", preset_val,
+                    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_path,
+                ]
+
+        # ── Run FFmpeg ────────────────────────────────────────
+        logging.info(
+            f"🎬 overlay_with_layout: running FFmpeg for segment "
+            f"[layout={layout_id}]"
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logging.error(
+                f"❌ overlay_with_layout FFmpeg failed "
+                f"[layout={layout_id}]: {result.stderr[-600:]}"
+            )
+            return None
+
+        if not os.path.exists(output_path):
+            logging.error(
+                f"❌ overlay_with_layout: output not created: {output_path}"
+            )
+            return None
+
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        logging.info(
+            f"✅ overlay_with_layout done: {output_path} "
+            f"({file_size:.1f}MB) [layout={layout_id}]"
+        )
+        return output_path
+
+    except Exception as e:
+        logging.error(
+            f"❌ overlay_with_layout crashed [layout={layout_id}]: {e}",
+            exc_info=True,
+        )
+        return None
+
+
+# def encode_video_segment(segment_info):
+#     (
+#         segment,
+#         media_pool,
+#         segment_audio_path,
+#         section_dir,
+#         chunk_folder,
+#         i,
+#         used_media_dict,
+#         media_lock,
+#         mode,
+#         avatar,
+#         background_video,
+#         segments,
+#         script_context,
+#         orientation,
+#         storyboard,
+#         kenburns,
+#         avatar_active,
+#         gpu_semaphore,
+#         effect_assignment,
+#         whisk_shared_state,
+#         head_freeze_sec,
+#         talking_heads_mode,
+#     ) = segment_info
+
+#     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
+#     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
+
+#     CURRENT_ORIENTATION = orientation
+#     CURRENT_STORYBOARD_ENABLED = bool(storyboard)
+#     CURRENT_KENBURNS_ENABLED = bool(kenburns)
+
+#     if orientation == "portrait":
+#         CURRENT_WIDTH, CURRENT_HEIGHT = 1080, 1920
+#     else:
+#         CURRENT_WIDTH, CURRENT_HEIGHT = 1920, 1080
+
+#     canvas_w = CURRENT_WIDTH
+#     canvas_h = CURRENT_HEIGHT
+
+#     chunk_filename = f"chunk_{i}_{uuid.uuid4()}.mp4"
+#     chunk_path = os.path.join(chunk_folder, chunk_filename)
+
+#     print(f"[{i}] Audio path: {segment_audio_path}")
+#     prev_segments = get_prev_two_context_text(segments, i)
+#     print("These are the 2 previous segments ", prev_segments)
+
+#     logging.info(f"🔹 Processing segment {i}: {segment['text'][:50]}...")
+
+#     use_nvenc = torch.cuda.is_available()
+#     video_codec = "h264_nvenc" if use_nvenc else "libx264"
+#     preset_val = "p3" if use_nvenc else "medium"
+
+#     try:
+#         character_name = segment["character"]
+#         segment_tag = segment.get("tag")
+
+#         # ============================================================
+#         # TEXT-ONLY SEGMENT
+#         # ============================================================
+#         if character_name.lower() == "text":
+#             logging.info(f"📝 Text-only segment {i} detected")
+
+#             if segment_audio_path and os.path.exists(segment_audio_path):
+#                 segment_audio = AudioFileClip(segment_audio_path, fps=44100)
+#                 duration_needed = segment_audio.duration
+#                 segment_audio = segment_audio.set_fps(44100).volumex(2)
+#             else:
+#                 words = len(segment['text'].split())
+#                 duration_needed = max(3.0, words * 0.35)
+#                 segment_audio = None
+
+#             bg_color = segment.get("text_bg_color", (178, 34, 34))
+#             text_color = segment.get("text_color", "white")
+#             fontsize = segment.get("text_fontsize", None)
+#             fade_duration = segment.get("text_fade_duration", 0.8)
+
+#             text_clip = create_text_segment_with_lines(
+#                 text=segment['text'],
+#                 duration=duration_needed,
+#                 canvas_w=canvas_w,
+#                 canvas_h=canvas_h,
+#                 bg_color=bg_color,
+#                 text_color=text_color,
+#                 fontsize=fontsize,
+#                 fade_duration=fade_duration
+#             )
+
+#             if segment_audio:
+#                 text_clip = text_clip.set_audio(segment_audio)
+
+#             text_clip.write_videofile(
+#                 chunk_path,
+#                 codec=video_codec,
+#                 audio_codec="aac" if segment_audio else None,
+#                 audio_fps=44100 if segment_audio else None,
+#                 threads=4,
+#                 fps=30,
+#                 preset=preset_val,
+#                 ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "faststart"]
+#             )
+
+#             text_clip.close()
+#             if segment_audio:
+#                 segment_audio.close()
+
+#             logging.info(f"✅ Text segment {i} completed: {chunk_path}")
+#             return chunk_path
+
+#         # ============================================================
+#         # CLIP SEGMENT — use downloaded video's original audio
+#         # (unchanged: already content-only, no avatar/bg dependency)
+#         # ============================================================
+#         segment_text = segment.get("text", "").strip()
+#         is_clip_segment = segment_text.startswith("[CLIP:") and segment_text.endswith("]")
+
+#         if is_clip_segment:
+#             logging.info(f"🎬 CLIP segment {i} detected")
+
+#             if not segment_tag:
+#                 logging.error(f"❌ CLIP segment {i} has no tag — cannot find video in library")
+#                 return None
+
+#             tagged_media = [
+#                 m for m in media_pool
+#                 if m["character"] == character_name and m.get("tag") == segment_tag
+#             ]
+
+#             if not tagged_media:
+#                 logging.error(f"❌ CLIP segment {i}: no media found in library with tag '{segment_tag}'")
+#                 return None
+
+#             selected = tagged_media[0]
+
+#             if selected["type"] != "video":
+#                 logging.error(f"❌ CLIP segment {i}: tagged media is not a video")
+#                 return None
+
+#             cmd = [
+#                 'ffmpeg', '-y',
+#                 '-i', selected["path"],
+#                 '-c:v', video_codec, '-preset', preset_val,
+#                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                 '-pix_fmt', 'yuv420p',
+#                 '-movflags', 'faststart',
+#                 chunk_path
+#             ]
+#             result = subprocess.run(cmd, capture_output=True, text=True)
+#             if result.returncode != 0:
+#                 logging.error(f"❌ CLIP segment {i} FFmpeg failed: {result.stderr[-500:]}")
+#                 return None
+
+#             logging.info(f"✅ CLIP segment {i} completed using original video audio: {chunk_path}")
+#             return chunk_path
+
+#         # ============================================================
+#         # COMMENTARY MODE WITH NARRATION
+#         # ============================================================
+#         if mode in ["commentary", "regenerate_commentary"] and segment_audio_path is not None:
+#             segment_audio = AudioFileClip(segment_audio_path, fps=44100)
+#             duration_needed = segment_audio.duration
+#             segment_audio = segment_audio.set_fps(44100).volumex(2)
+
+#             if segment_tag:
+#                 tagged_media = [
+#                     m for m in media_pool
+#                     if m["character"] == character_name and m.get("tag") == segment_tag
+#                 ]
+#                 if tagged_media:
+#                     selected = tagged_media[0]
+#                     if selected["type"] == "video":
+
+#                         if talking_heads_mode:
+#                             # ────────────────────────────────────────────
+#                             # RULE 1 — IRON RULE:
+#                             # output duration == narration audio duration,
+#                             # exactly. No avatar/border/background — those
+#                             # are added in the post-assembly composite.
+#                             # Source video audio fully discarded (muted).
+#                             # -stream_loop -1 (input-level) loops source
+#                             # if shorter than narration; trim cuts to exact
+#                             # length; setpts zeroes timestamps so video and
+#                             # audio both start at PTS=0 with no lead-in gap.
+#                             # ────────────────────────────────────────────
+#                             cmd = [
+#                                 'ffmpeg', '-y',
+#                                 '-stream_loop', '-1', '-i', selected["path"],
+#                                 '-i', segment_audio_path,
+#                                 '-filter_complex',
+#                                 f"[0:v]trim=duration={round(duration_needed,4)},"
+#                                 f"setpts=PTS-STARTPTS,"
+#                                 f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,"
+#                                 f"crop={canvas_w}:{canvas_h},"
+#                                 f"format=yuv420p[v]",
+#                                 '-map', '[v]',
+#                                 '-map', '1:a:0',
+#                                 '-c:v', video_codec, '-preset', preset_val,
+#                                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                                 '-r', '30', '-vsync', 'cfr',
+#                                 '-shortest',
+#                                 '-pix_fmt', 'yuv420p',
+#                                 '-movflags', 'faststart',
+#                                 chunk_path
+#                             ]
+#                             result = subprocess.run(cmd, capture_output=True, text=True)
+#                             if result.returncode == 0 and os.path.exists(chunk_path):
+#                                 logging.info(
+#                                     f"✅ Tagged narration segment {i} (talking-heads, content-only): {chunk_path}"
+#                                 )
+#                                 segment_audio.close()
+#                                 return chunk_path
+#                             else:
+#                                 logging.warning(
+#                                     f"⚠️ Talking-heads content-only encode failed for segment {i}: "
+#                                     f"{result.stderr[-300:]} — falling through to best-media fallback"
+#                                 )
+
+#                         else:
+#                             result = overlay_avatar_with_audio(
+#                                 resized_clip=selected["path"],
+#                                 avatar_path="avatar.mp4",
+#                                 audio_path=segment_audio_path,
+#                                 output_path=chunk_path,
+#                                 avatar_active=avatar_active
+#                             )
+#                             if result and os.path.exists(result):
+#                                 logging.info(f"✅ Tagged narration segment {i} completed: {result}")
+#                                 segment_audio.close()
+#                                 return result
+#                             else:
+#                                 logging.warning(f"⚠️ overlay_avatar_with_audio failed for tagged segment {i} — falling through to best-media fallback")
+
+#             logging.info(f"🔁 No tag or tag fallback — running best-media for segment {i}")
+#             reset_overlay_usage_for_new_clip()
+
+#             selected_media = find_best_media_combination(
+#                 media_pool, segment, character_name, duration_needed,
+#                 used_media_dict, media_lock, mode, i,
+#                 script_context, prev_segments, whisk_shared_state
+#             )
+
+#             if not selected_media:
+#                 logging.error(f"❌ No fallback media for segment {i}")
+#                 return None
+
+#             temp_clip_path = os.path.join(chunk_folder, f"temp_clip_{i}_{uuid.uuid4()}.mp4")
+#             processed_clips = []
+#             corrupt_clips_count = 0
+
+#             for item_idx, item in enumerate(selected_media):
+#                 media = item["media"]
+#                 dur = item["duration"]
+#                 clip_output = os.path.join(chunk_folder, f"clip_{i}_{item_idx}_{uuid.uuid4()}.mp4")
+#                 clip_created = False
+
+#                 try:
+#                     if media["type"] == "video":
+#                         video_path = media["path"]
+
+#                         if not os.path.exists(video_path):
+#                             raise ValueError(f"Video file missing: {video_path}")
+#                         file_size = os.path.getsize(video_path)
+#                         if file_size < 10000:
+#                             raise ValueError(f"Video file too small: {file_size} bytes")
+
+#                         test_clip = VideoFileClip(video_path)
+#                         test_duration = test_clip.duration
+#                         test_w = test_clip.w
+#                         test_h = test_clip.h
+#                         test_clip.close()
+
+#                         if test_duration <= 0:
+#                             raise ValueError(f"Video has zero duration")
+#                         if test_w <= 0 or test_h <= 0:
+#                             raise ValueError(f"Invalid dimensions: {test_w}x{test_h}")
+
+#                         subclip_dur = min(dur, media["duration"])
+
+#                         cmd = [
+#                             'ffmpeg', '-y',
+#                             '-i', video_path,
+#                             '-t', str(round(subclip_dur, 4)),
+#                             '-vf', f'fps=30,scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,'
+#                                    f'pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2',
+#                             '-c:v', video_codec, '-preset', preset_val,
+#                             '-r', '30', '-vsync', 'cfr',
+#                             '-avoid_negative_ts', 'make_zero',
+#                             '-g', '30', '-bf', '0',
+#                         ]
+#                         if media.get("mute", False):
+#                             cmd.extend(['-an'])
+#                         else:
+#                             cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100'])
+#                         cmd.extend(['-pix_fmt', 'yuv420p', '-movflags', 'faststart', clip_output])
+
+#                         result = subprocess.run(cmd, capture_output=True, text=True)
+#                         if result.returncode != 0:
+#                             raise RuntimeError(f"FFmpeg video encoding failed: {result.stderr[-500:]}")
+
+#                         clip_created = True
+#                         logging.info(f"🎥 Video clip {item_idx + 1}: {os.path.basename(video_path)} ({dur:.2f}s)")
+
+#                     else:
+#                         from gpu_kenburns_simple import get_secondary_effect, get_motion_speed
+
+#                         _primary_effect  = effect_assignment["primary_effect"]
+#                         _video_seed      = effect_assignment["video_seed"]
+#                         _global_clip_idx = effect_assignment["global_clip_idx"]
+
+#                         if item_idx == 0:
+#                             _chosen_effect = _primary_effect
+#                         else:
+#                             _chosen_effect = get_secondary_effect(
+#                                 primary_effect=_primary_effect,
+#                                 item_idx=item_idx,
+#                                 global_clip_idx=_global_clip_idx,
+#                                 video_seed=_video_seed,
+#                             )
+
+#                         _speed = get_motion_speed(
+#                             duration=dur,
+#                             segment_text=segment.get("text", ""),
+#                             effect_type=_chosen_effect,
+#                             segment_index=_global_clip_idx,
+#                             video_seed=_video_seed,
+#                         )
+
+#                         _clip_output = clip_output
+#                         _image_path  = media["path"]
+#                         _freeze = head_freeze_sec if item_idx == 0 else 0.0
+
+#                         def _render_commentary():
+#                             return create_image_video_with_effects(
+#                                 image_path=_image_path,
+#                                 duration=dur,
+#                                 canvas_w=canvas_w,
+#                                 canvas_h=canvas_h,
+#                                 output_path=_clip_output,
+#                                 mode=mode,
+#                                 index=_global_clip_idx,
+#                                 kenburns_enabled=CURRENT_KENBURNS_ENABLED,
+#                                 storyboard_enabled=CURRENT_STORYBOARD_ENABLED,
+#                                 fps=30,
+#                                 effect_override=_chosen_effect,
+#                                 speed_override=_speed,
+#                                 segment_text=segment.get("text", ""),
+#                                 head_freeze_sec=_freeze,
+#                             )
+
+#                         _gpu_acquired = False
+#                         try:
+#                             logging.info(f"🔒 Seg {i} item {item_idx}: acquiring gpu_semaphore...")
+#                             gpu_semaphore.acquire()
+#                             _gpu_acquired = True
+#                             logging.info(f"🟢 Seg {i} item {item_idx}: gpu_semaphore acquired")
+
+#                             render_result, render_error = _gpu_render_with_timeout(_render_commentary, timeout=600)
+
+#                             if render_error is not None:
+#                                 raise render_error
+
+#                             clip_output = render_result
+#                             clip_created = True
+#                             logging.info(f"🖼️ Image clip {item_idx + 1}: {os.path.basename(media['path'])} ({dur:.2f}s)")
+
+#                         finally:
+#                             if _gpu_acquired:
+#                                 gpu_semaphore.release()
+#                                 logging.info(f"🔓 Seg {i} item {item_idx}: gpu_semaphore released")
+
+#                 except Exception as e:
+#                     corrupt_clips_count += 1
+#                     logging.error(f"❌ Clip {item_idx + 1}/{len(selected_media)} FAILED: {e}")
+#                     logging.warning(f"🎬 Replacing with black frame placeholder ({dur:.2f}s)")
+
+#                     try:
+#                         cmd = [
+#                             'ffmpeg', '-y', '-f', 'lavfi',
+#                             '-i', f'color=c=black:s={canvas_w}x{canvas_h}:d={round(dur, 4)}:r=30',
+#                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+#                             '-preset', 'ultrafast', clip_output
+#                         ]
+#                         result = subprocess.run(cmd, capture_output=True, text=True)
+#                         if result.returncode != 0:
+#                             raise RuntimeError("FFmpeg black frame failed")
+#                         clip_created = True
+#                         logging.info(f"✅ Black frame replacement created for clip {item_idx + 1}")
+
+#                     except Exception as fallback_err:
+#                         logging.error(f"💀 Black frame fallback also failed: {fallback_err}")
+#                         try:
+#                             import numpy as np
+#                             black_array = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8) + 10
+#                             frame_bytes = black_array.tobytes()
+#                             total_frames = int(dur * 30)
+#                             cmd = [
+#                                 'ffmpeg', '-y',
+#                                 '-f', 'rawvideo', '-vcodec', 'rawvideo',
+#                                 '-s', f'{canvas_w}x{canvas_h}',
+#                                 '-pix_fmt', 'rgb24', '-r', '30',
+#                                 '-i', '-',
+#                                 '-t', str(round(dur, 4)),
+#                                 '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+#                                 '-preset', 'ultrafast', clip_output
+#                             ]
+#                             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+#                                                     stdout=subprocess.DEVNULL,
+#                                                     stderr=subprocess.DEVNULL)
+#                             for _ in range(total_frames):
+#                                 proc.stdin.write(frame_bytes)
+#                             proc.stdin.close()
+#                             proc.wait()
+#                             if proc.returncode == 0:
+#                                 clip_created = True
+#                                 logging.info(f"✅ Numpy emergency black clip created for clip {item_idx + 1}")
+#                             else:
+#                                 clip_created = False
+#                         except Exception as emergency_err:
+#                             logging.critical(f"💥 All fallbacks failed for clip {item_idx + 1}: {emergency_err}")
+#                             clip_created = False
+
+#                 if clip_created and os.path.exists(clip_output):
+#                     processed_clips.append(clip_output)
+#                 else:
+#                     logging.critical(f"💥 Could not create ANY clip for item {item_idx + 1}")
+
+#             if not processed_clips:
+#                 logging.error(f"❌ No valid clips for segment {i} - ALL clips failed")
+#                 raise RuntimeError(f"All clips failed for segment {i}")
+
+#             if corrupt_clips_count > 0:
+#                 logging.warning(f"⚠️ Segment {i}: {corrupt_clips_count}/{len(selected_media)} clips replaced with black frames")
+
+#             if CURRENT_STORYBOARD_ENABLED and len(processed_clips) > 1:
+#                 inputs = []
+#                 for cp in processed_clips:
+#                     inputs.extend(['-i', cp])
+
+#                 durations = []
+#                 for cp in processed_clips:
+#                     p = subprocess.run(
+#                         ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+#                          '-of', 'default=noprint_wrappers=1:nokey=1', cp],
+#                         capture_output=True, text=True
+#                     )
+#                     durations.append(float(p.stdout.strip()))
+
+#                 transition_duration = 0.5
+#                 filter_complex = ""
+#                 offset = 0.0
+
+#                 for idx in range(len(processed_clips) - 1):
+#                     if idx == 0:
+#                         offset = durations[0] - transition_duration
+#                         filter_complex += (
+#                             f"[0:v][1:v]xfade=transition=fade:"
+#                             f"duration={transition_duration}:"
+#                             f"offset={round(offset, 4)}[v{idx}];"
+#                         )
+#                     else:
+#                         offset += durations[idx] - transition_duration
+#                         filter_complex += (
+#                             f"[v{idx-1}][{idx+1}:v]xfade=transition=fade:"
+#                             f"duration={transition_duration}:"
+#                             f"offset={round(offset, 4)}[v{idx}];"
+#                         )
+
+#                 final_label = f"[v{len(processed_clips) - 2}]" if len(processed_clips) > 2 else "[v0]"
+#                 cmd = [
+#                     'ffmpeg', '-y',
+#                     *inputs,
+#                     '-filter_complex', filter_complex,
+#                     '-map', final_label,
+#                     '-c:v', video_codec, '-preset', preset_val,
+#                     '-t', str(round(duration_needed, 4)),
+#                     '-pix_fmt', 'yuv420p',
+#                     '-movflags', 'faststart',
+#                     temp_clip_path
+#                 ]
+#             elif len(processed_clips) == 1:
+#                 cmd = [
+#                     'ffmpeg', '-y',
+#                     '-i', processed_clips[0],
+#                     '-c:v', video_codec, '-preset', preset_val,
+#                     '-t', str(round(duration_needed, 4)),
+#                     '-pix_fmt', 'yuv420p',
+#                     '-movflags', 'faststart',
+#                     temp_clip_path
+#                 ]
+#             else:
+#                 concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
+#                 with open(concat_list_path, 'w') as f:
+#                     for cp in processed_clips:
+#                         f.write(f"file '{os.path.abspath(cp)}'\n")
+#                 cmd = [
+#                     'ffmpeg', '-y',
+#                     '-f', 'concat', '-safe', '0',
+#                     '-i', concat_list_path,
+#                     '-c:v', video_codec, '-preset', preset_val,
+#                     '-t', str(round(duration_needed, 4)),
+#                     '-pix_fmt', 'yuv420p',
+#                     '-movflags', 'faststart',
+#                     temp_clip_path
+#                 ]
+
+#             result = subprocess.run(cmd, capture_output=True, text=True)
+#             if result.returncode != 0:
+#                 logging.error(f"FFmpeg concat STDERR: {result.stderr[-1000:]}")
+#                 return None
+
+#             for cp in processed_clips:
+#                 if os.path.exists(cp):
+#                     os.remove(cp)
+
+#             if talking_heads_mode:
+#                 # Content-only finalize: re-encode temp_clip_path to lock
+#                 # duration exactly to narration audio, no avatar/border/bg.
+#                 cmd = [
+#                     'ffmpeg', '-y',
+#                     '-stream_loop', '-1', '-i', temp_clip_path,
+#                     '-i', segment_audio_path,
+#                     '-filter_complex',
+#                     f"[0:v]trim=duration={round(duration_needed,4)},"
+#                     f"setpts=PTS-STARTPTS,format=yuv420p[v]",
+#                     '-map', '[v]',
+#                     '-map', '1:a:0',
+#                     '-c:v', video_codec, '-preset', preset_val,
+#                     '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                     '-r', '30', '-vsync', 'cfr',
+#                     '-shortest',
+#                     '-pix_fmt', 'yuv420p',
+#                     '-movflags', 'faststart',
+#                     chunk_path
+#                 ]
+#                 result = subprocess.run(cmd, capture_output=True, text=True)
+#                 if os.path.exists(temp_clip_path):
+#                     os.remove(temp_clip_path)
+
+#                 if result.returncode == 0 and os.path.exists(chunk_path):
+#                     logging.info(f"✅ Fallback narration segment {i} (talking-heads, content-only): {chunk_path}")
+#                     return chunk_path
+#                 else:
+#                     logging.error(f"❌ Talking-heads fallback finalize failed for segment {i}: {result.stderr[-300:]}")
+#                     return None
+
+#             final_overlayed_path = overlay_avatar_with_audio(
+#                 resized_clip=temp_clip_path,
+#                 avatar_path="avatar.mp4",
+#                 audio_path=segment_audio_path,
+#                 output_path=chunk_path,
+#                 avatar_active=avatar_active
+#             )
+
+#             if os.path.exists(temp_clip_path):
+#                 os.remove(temp_clip_path)
+
+#             return final_overlayed_path
+
+#         # ============================================================
+#         # COMMENTARY WITHOUT NARRATION
+#         # ============================================================
+#         if mode in ["commentary", "regenerate_commentary"] and segment_audio_path is None and segment_tag:
+#             tagged_media = [
+#                 m for m in media_pool
+#                 if m["character"] == character_name and m.get("tag") == segment_tag
+#             ]
+#             if tagged_media:
+#                 selected = tagged_media[0]
+#                 if selected["type"] == "video":
+#                     overlay_avatar_no_audio(
+#                         selected["path"],
+#                         f"channel_media/{avatar}",
+#                         f"channel_media/{background_video}",
+#                         chunk_path,
+#                         segment_tag,
+#                         media_pool=media_pool,
+#                         character_name=character_name,
+#                         talking_heads_mode=talking_heads_mode,
+#                     )
+#                     return chunk_path
+
+#         # ============================================================
+#         # NON-COMMENTARY WITH TAG BUT NO AUDIO
+#         # ============================================================
+#         if segment_audio_path is None and segment_tag:
+#             tagged_media = [
+#                 m for m in media_pool
+#                 if m["character"] == character_name and m.get("tag") == segment_tag
+#             ]
+#             if tagged_media:
+#                 selected = tagged_media[0]
+#                 if selected["type"] == "video":
+#                     full_video = VideoFileClip(selected["path"])
+#                     duration = full_video.duration
+#                     audio = full_video.audio.set_fps(44100)
+
+#                     logging.info(f"⏱️ Duration {duration:.2f}s — encoding directly without overlay.")
+#                     final_clip = full_video.set_audio(audio.set_duration(duration))
+#                     final_clip.write_videofile(
+#                         chunk_path,
+#                         codec=video_codec,
+#                         audio_codec="aac",
+#                         audio_fps=44100,
+#                         threads=4,
+#                         fps=30,
+#                         ffmpeg_params=["-pix_fmt", "yuv420p", "-preset", preset_val,
+#                                        "-movflags", "faststart", "-shortest"]
+#                     )
+#                     full_video.close()
+#                     return chunk_path
+
+#         # ============================================================
+#         # DEFAULT: NORMAL AUDIO-BASED SEGMENT
+#         # ============================================================
+#         if not segment_audio_path or not os.path.exists(segment_audio_path):
+#             logging.error(f"❌ No audio file for segment {i}")
+#             return None
+
+#         segment_audio = AudioFileClip(segment_audio_path, fps=44100)
+#         duration_needed = segment_audio.duration
+#         segment_audio = segment_audio.set_fps(44100).volumex(2)
+
+#         selected_media = find_best_media_combination(
+#             media_pool, segment, character_name,
+#             duration_needed, used_media_dict,
+#             media_lock, mode, i, script_context, prev_segments, whisk_shared_state
+#         )
+
+#         if not selected_media:
+#             logging.error(f"❌ No media selected for segment {i}")
+#             return None
+
+#         processed_clips = []
+#         corrupt_clips_count = 0
+
+#         for item_idx, item in enumerate(selected_media):
+#             media = item["media"]
+#             dur = item["duration"]
+#             clip_output = os.path.join(chunk_folder, f"clip_{i}_{item_idx}_{uuid.uuid4()}.mp4")
+#             clip_created = False
+
+#             try:
+#                 if media["type"] == "video":
+#                     video_path = media["path"]
+
+#                     if not os.path.exists(video_path):
+#                         raise ValueError(f"Video file missing: {video_path}")
+#                     file_size = os.path.getsize(video_path)
+#                     if file_size < 10000:
+#                         raise ValueError(f"Video file too small: {file_size} bytes")
+
+#                     test_clip = VideoFileClip(video_path)
+#                     test_duration = test_clip.duration
+#                     test_w = test_clip.w
+#                     test_h = test_clip.h
+#                     test_clip.close()
+
+#                     if test_duration <= 0:
+#                         raise ValueError(f"Video has zero duration")
+#                     if test_w <= 0 or test_h <= 0:
+#                         raise ValueError(f"Invalid dimensions: {test_w}x{test_h}")
+
+#                     subclip_dur = min(dur, media["duration"])
+
+#                     cmd = [
+#                         'ffmpeg', '-y',
+#                         '-i', video_path,
+#                         '-t', str(round(subclip_dur, 4)),
+#                         '-vf', f'fps=30,scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,'
+#                                f'pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2',
+#                         '-c:v', video_codec, '-preset', preset_val,
+#                         '-r', '30', '-vsync', 'cfr',
+#                         '-avoid_negative_ts', 'make_zero',
+#                         '-g', '30', '-bf', '0',
+#                     ]
+#                     if media.get("mute", False):
+#                         cmd.extend(['-an'])
+#                     else:
+#                         cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100'])
+#                     cmd.extend(['-pix_fmt', 'yuv420p', '-movflags', 'faststart', clip_output])
+
+#                     result = subprocess.run(cmd, capture_output=True, text=True)
+#                     if result.returncode != 0:
+#                         raise RuntimeError(f"FFmpeg video encoding failed: {result.stderr[-500:]}")
+
+#                     clip_created = True
+#                     logging.info(f"🎥 Video clip {item_idx + 1}: {os.path.basename(video_path)} ({dur:.2f}s)")
+
+#                 else:
+#                     from gpu_kenburns_simple import get_secondary_effect, get_motion_speed
+
+#                     _primary_effect  = effect_assignment["primary_effect"]
+#                     _video_seed      = effect_assignment["video_seed"]
+#                     _global_clip_idx = effect_assignment["global_clip_idx"]
+
+#                     if item_idx == 0:
+#                         _chosen_effect = _primary_effect
+#                     else:
+#                         _chosen_effect = get_secondary_effect(
+#                             primary_effect=_primary_effect,
+#                             item_idx=item_idx,
+#                             global_clip_idx=_global_clip_idx,
+#                             video_seed=_video_seed,
+#                         )
+
+#                     _speed = get_motion_speed(
+#                         duration=dur,
+#                         segment_text=segment.get("text", ""),
+#                         effect_type=_chosen_effect,
+#                         segment_index=_global_clip_idx,
+#                         video_seed=_video_seed,
+#                     )
+
+#                     _clip_output = clip_output
+#                     _image_path  = media["path"]
+#                     _freeze = head_freeze_sec if item_idx == 0 else 0.0
+
+#                     def _render_default():
+#                         return create_image_video_with_effects(
+#                             image_path=_image_path,
+#                             duration=dur,
+#                             canvas_w=canvas_w,
+#                             canvas_h=canvas_h,
+#                             output_path=_clip_output,
+#                             mode=mode,
+#                             index=_global_clip_idx,
+#                             kenburns_enabled=CURRENT_KENBURNS_ENABLED,
+#                             storyboard_enabled=CURRENT_STORYBOARD_ENABLED,
+#                             fps=30,
+#                             effect_override=_chosen_effect,
+#                             speed_override=_speed,
+#                             segment_text=segment.get("text", ""),
+#                             head_freeze_sec=_freeze,
+#                         )
+
+#                     _gpu_acquired = False
+#                     try:
+#                         logging.info(f"🔒 Seg {i} item {item_idx}: acquiring gpu_semaphore...")
+#                         gpu_semaphore.acquire()
+#                         _gpu_acquired = True
+#                         logging.info(f"🟢 Seg {i} item {item_idx}: gpu_semaphore acquired")
+
+#                         render_result, render_error = _gpu_render_with_timeout(_render_default, timeout=600)
+
+#                         if render_error is not None:
+#                             raise render_error
+
+#                         clip_output = render_result
+#                         clip_created = True
+#                         logging.info(f"🖼️ Image clip {item_idx + 1}: {os.path.basename(media['path'])} ({dur:.2f}s)")
+
+#                     finally:
+#                         if _gpu_acquired:
+#                             gpu_semaphore.release()
+#                             logging.info(f"🔓 Seg {i} item {item_idx}: gpu_semaphore released")
+
+#             except Exception as e:
+#                 corrupt_clips_count += 1
+#                 logging.error(f"❌ Clip {item_idx + 1}/{len(selected_media)} FAILED: {e}")
+#                 logging.warning(f"🎬 Replacing with black frame placeholder ({dur:.2f}s)")
+
+#                 try:
+#                     cmd = [
+#                         'ffmpeg', '-y', '-f', 'lavfi',
+#                         '-i', f'color=c=black:s={canvas_w}x{canvas_h}:d={round(dur, 4)}:r=30',
+#                         '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+#                         '-preset', 'ultrafast', clip_output
+#                     ]
+#                     result = subprocess.run(cmd, capture_output=True, text=True)
+#                     if result.returncode != 0:
+#                         raise RuntimeError("FFmpeg black frame failed")
+#                     clip_created = True
+#                     logging.info(f"✅ Black frame replacement created for clip {item_idx + 1}")
+
+#                 except Exception as fallback_err:
+#                     logging.error(f"💀 Black frame fallback also failed: {fallback_err}")
+#                     try:
+#                         import numpy as np
+#                         black_array = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8) + 10
+#                         frame_bytes = black_array.tobytes()
+#                         total_frames = int(dur * 30)
+#                         cmd = [
+#                             'ffmpeg', '-y',
+#                             '-f', 'rawvideo', '-vcodec', 'rawvideo',
+#                             '-s', f'{canvas_w}x{canvas_h}',
+#                             '-pix_fmt', 'rgb24', '-r', '30',
+#                             '-i', '-',
+#                             '-t', str(round(dur, 4)),
+#                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+#                             '-preset', 'ultrafast', clip_output
+#                         ]
+#                         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+#                                                 stdout=subprocess.DEVNULL,
+#                                                 stderr=subprocess.DEVNULL)
+#                         for _ in range(total_frames):
+#                             proc.stdin.write(frame_bytes)
+#                         proc.stdin.close()
+#                         proc.wait()
+#                         if proc.returncode == 0:
+#                             clip_created = True
+#                             logging.info(f"✅ Numpy emergency black clip created for clip {item_idx + 1}")
+#                         else:
+#                             clip_created = False
+#                     except Exception as emergency_err:
+#                         logging.critical(f"💥 All fallbacks failed for clip {item_idx + 1}: {emergency_err}")
+#                         clip_created = False
+
+#             if clip_created and os.path.exists(clip_output):
+#                 processed_clips.append(clip_output)
+#             else:
+#                 logging.critical(f"💥 Could not create ANY clip for item {item_idx + 1}")
+
+#         if not processed_clips:
+#             logging.error(f"❌ No valid clips for segment {i} - ALL clips failed")
+#             raise RuntimeError(f"All clips failed for segment {i}")
+
+#         if corrupt_clips_count > 0:
+#             logging.warning(f"⚠️ Segment {i}: {corrupt_clips_count}/{len(selected_media)} clips replaced with black frames")
+
+#         if CURRENT_STORYBOARD_ENABLED and len(processed_clips) > 1:
+#             inputs = []
+#             for cp in processed_clips:
+#                 inputs.extend(['-i', cp])
+#             inputs.extend(['-i', segment_audio_path])
+
+#             durations = []
+#             for cp in processed_clips:
+#                 p = subprocess.run(
+#                     ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+#                      '-of', 'default=noprint_wrappers=1:nokey=1', cp],
+#                     capture_output=True, text=True
+#                 )
+#                 durations.append(float(p.stdout.strip()))
+
+#             transition_duration = 0.5
+#             filter_complex = ""
+#             offset = 0.0
+
+#             for idx in range(len(processed_clips) - 1):
+#                 if idx == 0:
+#                     offset = durations[0] - transition_duration
+#                     filter_complex += (
+#                         f"[0:v][1:v]xfade=transition=fade:"
+#                         f"duration={transition_duration}:"
+#                         f"offset={round(offset, 4)}[v{idx}];"
+#                     )
+#                 else:
+#                     offset += durations[idx] - transition_duration
+#                     filter_complex += (
+#                         f"[v{idx-1}][{idx+1}:v]xfade=transition=fade:"
+#                         f"duration={transition_duration}:"
+#                         f"offset={round(offset, 4)}[v{idx}];"
+#                     )
+
+#             final_label = f"[v{len(processed_clips) - 2}]" if len(processed_clips) > 2 else "[v0]"
+#             n_video_inputs = len(processed_clips)
+#             cmd = [
+#                 'ffmpeg', '-y',
+#                 *inputs,
+#                 '-filter_complex', filter_complex,
+#                 '-map', final_label,
+#                 '-map', f'{n_video_inputs}:a:0',
+#                 '-c:v', video_codec, '-preset', preset_val,
+#                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                 '-t', str(round(duration_needed, 4)),
+#                 '-pix_fmt', 'yuv420p',
+#                 '-movflags', 'faststart',
+#                 chunk_path
+#             ]
+
+#         elif len(processed_clips) == 1:
+#             cmd = [
+#                 'ffmpeg', '-y',
+#                 '-i', processed_clips[0],
+#                 '-i', segment_audio_path,
+#                 '-c:v', video_codec, '-preset', preset_val,
+#                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                 '-map', '0:v:0', '-map', '1:a:0',
+#                 '-t', str(round(duration_needed, 4)),
+#                 '-pix_fmt', 'yuv420p',
+#                 '-movflags', 'faststart',
+#                 chunk_path
+#             ]
+
+#         else:
+#             concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
+#             with open(concat_list_path, 'w') as f:
+#                 for cp in processed_clips:
+#                     f.write(f"file '{os.path.abspath(cp)}'\n")
+#             cmd = [
+#                 'ffmpeg', '-y',
+#                 '-f', 'concat', '-safe', '0',
+#                 '-i', concat_list_path,
+#                 '-i', segment_audio_path,
+#                 '-c:v', video_codec, '-preset', preset_val,
+#                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+#                 '-map', '0:v:0', '-map', '1:a:0',
+#                 '-t', str(round(duration_needed, 4)),
+#                 '-pix_fmt', 'yuv420p',
+#                 '-movflags', 'faststart',
+#                 chunk_path
+#             ]
+
+#         logging.debug(f"Final encode: {' '.join(cmd[:10])}...")
+#         result = subprocess.run(cmd, capture_output=True, text=True)
+#         if result.returncode != 0:
+#             logging.error(f"FFmpeg final encode STDERR: {result.stderr[-1000:]}")
+#             return None
+
+#         for cp in processed_clips:
+#             if os.path.exists(cp):
+#                 os.remove(cp)
+#         if 'concat_list_path' in locals() and os.path.exists(concat_list_path):
+#             os.remove(concat_list_path)
+
+#         segment_audio.close()
+
+#         logging.info(f"✅ Segment {i} completed: {chunk_path}")
+#         return chunk_path
+
+#     except Exception as e:
+#         logging.error(f"❌ Segment {i} crashed: {e}", exc_info=True)
+#         return None
+
+#     finally:
+#         if torch.cuda.is_available():
+#             torch.cuda.empty_cache()
+#         gc.collect()
+
 
 def encode_video_segment(segment_info):
     (
@@ -11022,10 +13686,27 @@ def encode_video_segment(segment_info):
         kenburns,
         avatar_active,
         gpu_semaphore,
+        nvenc_semaphore,
         effect_assignment,
         whisk_shared_state,
-        head_freeze_sec,       # ✅ NEW: KB head freeze duration for this segment
-    ) = segment_info
+        head_freeze_sec,
+        talking_heads_mode,
+        intro_teaser_config,
+        narration_images_config,
+        section_type,
+    ) = segment_info[:26]
+
+    storyboard_semaphore = segment_info[26] if len(segment_info) > 26 else _storyboard_sem_fallback
+    layout_config = segment_info[27] if len(segment_info) > 27 else None
+    _register_storyboard_semaphore(storyboard_semaphore)
+
+    from helper.teaser_backend import (
+        is_intro_tag,
+        resolve_narration_image,
+        download_image_to_local,
+        apply_intro_teaser_overlay,
+        narration_override_mode,
+    )
 
     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
@@ -11045,49 +13726,222 @@ def encode_video_segment(segment_info):
     chunk_filename = f"chunk_{i}_{uuid.uuid4()}.mp4"
     chunk_path = os.path.join(chunk_folder, chunk_filename)
 
-    print(f"[{i}] Audio path: {segment_audio_path}")
     prev_segments = get_prev_two_context_text(segments, i)
-    print("These are the 2 previous segments ", prev_segments)
-
     logging.info(f"🔹 Processing segment {i}: {segment['text'][:50]}...")
 
-    use_nvenc = torch.cuda.is_available()
+    use_nvenc = _segment_use_nvenc()
     video_codec = "h264_nvenc" if use_nvenc else "libx264"
     preset_val = "p3" if use_nvenc else "medium"
+
+    def _run_ffmpeg(cmd, label):
+        return _ffmpeg_run(
+            cmd,
+            timeout=FFMPEG_SEGMENT_TIMEOUT,
+            label=f"segment {i}: {label}",
+            nvenc_semaphore=nvenc_semaphore,
+            uses_nvenc=use_nvenc,
+        )
+
+    segment_audio = None
+    override_mode = narration_override_mode(narration_images_config)
+    has_segment_tag = bool((segment.get("tag") or "").strip())
+
+    def _full_avatar_skip_narration_media() -> bool:
+        return bool(
+            talking_heads_mode
+            and isinstance(layout_config, dict)
+            and (layout_config.get("layout_id") or "") == "full_avatar"
+        )
+
+    def _encode_full_avatar_narration_placeholder(duration_needed: float):
+        """Black video + narration audio only — no Pexels / AI / downloads."""
+        if duration_needed <= 0:
+            return None
+        if not segment_audio_path or not os.path.exists(segment_audio_path):
+            logging.warning(
+                f"⚠️ Segment {i}: full_avatar skip needs narration audio — none found"
+            )
+            return None
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i",
+            f"color=c=black:s={canvas_w}x{canvas_h}:d={duration_needed:.4f}:r=30",
+            "-i", segment_audio_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-r", "30", "-vsync", "cfr",
+            "-shortest",
+            "-avoid_negative_ts", "make_zero",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            chunk_path,
+        ]
+        r = _run_ffmpeg(cmd, "full_avatar narration placeholder")
+        if not r or r.returncode != 0 or not os.path.exists(chunk_path):
+            return None
+        logging.info(
+            f"⚡ Segment {i}: full_avatar — skipped narration media "
+            f"({duration_needed:.2f}s placeholder)"
+        )
+        return chunk_path
+
+    def _maybe_apply_intro_teaser(raw_path):
+        if not raw_path or not os.path.exists(raw_path):
+            return raw_path
+        if not is_intro_tag(segment.get("tag")):
+            return raw_path
+
+        teaser_out = os.path.join(chunk_folder, f"intro_teaser_{i}_{uuid.uuid4()}.mp4")
+        logging.info(f"📺 Applying intro teaser overlay to segment {i}")
+        try:
+            apply_intro_teaser_overlay(
+                input_path=raw_path,
+                output_path=teaser_out,
+                background_path=None,
+                teaser_config=intro_teaser_config,
+            )
+        except Exception as exc:
+            logging.error(f"❌ Intro teaser overlay failed for segment {i}: {exc}")
+            if os.path.isfile(teaser_out):
+                try:
+                    os.remove(teaser_out)
+                except OSError:
+                    pass
+            return raw_path
+        return teaser_out
+
+    def _render_forced_narration_image(duration_needed):
+        forced_url = resolve_narration_image(narration_images_config, section_type, i)
+        if not forced_url:
+            return None
+
+        local_img = download_image_to_local(
+            forced_url,
+            os.path.join(section_dir, f"forced_{section_type}_{i}.jpg"),
+        )
+        if not local_img:
+            logging.warning(f"⚠️ Could not resolve forced narration image for segment {i}")
+            return None
+
+        # Global narration image stays fixed on screen — blur/letterbox only.
+        force_stationary = override_mode == "global"
+        kb_enabled = False if force_stationary else CURRENT_KENBURNS_ENABLED
+        sb_enabled = False if force_stationary else CURRENT_STORYBOARD_ENABLED
+
+        if force_stationary:
+            logging.info(
+                f"📌 Segment {i}: global narration image — static "
+                f"(Ken Burns/storyboard disabled; blur/layout still applied)"
+            )
+
+        _primary_effect = effect_assignment["primary_effect"]
+        _video_seed = effect_assignment["video_seed"]
+        _global_clip_idx = effect_assignment["global_clip_idx"]
+        clip_output = os.path.join(chunk_folder, f"forced_{i}_{uuid.uuid4()}.mp4")
+        _speed = None
+
+        def _render():
+            return create_image_video_with_effects(
+                image_path=local_img,
+                duration=duration_needed,
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                output_path=clip_output,
+                mode=mode,
+                index=_global_clip_idx,
+                kenburns_enabled=kb_enabled,
+                storyboard_enabled=sb_enabled,
+                fps=30,
+                effect_override=_primary_effect,
+                speed_override=_speed,
+                segment_text=segment.get("text", ""),
+                head_freeze_sec=head_freeze_sec,
+                video_seed=_video_seed,
+                nvenc_semaphore=nvenc_semaphore,
+            )
+
+        _kb_locked = _kenburns_needs_gpu_lock() if kb_enabled else False
+        if _kb_locked:
+            _acquire_gpu_lock(gpu_semaphore, f"Segment {i} forced narration")
+        elif kb_enabled:
+            logging.info(f"🎬 Segment {i}: Ken Burns starting (ffmpeg)...")
+        try:
+            if kb_enabled:
+                from gpu_kenburns_simple import get_motion_speed
+
+                _speed = get_motion_speed(
+                    duration=duration_needed,
+                    segment_text=segment.get("text", ""),
+                    effect_type=_primary_effect,
+                    segment_index=_global_clip_idx,
+                    video_seed=_video_seed,
+                )
+            return _render()
+        finally:
+            if _kb_locked:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gpu_semaphore.release()
+                logging.info(f"🔓 Segment {i}: GPU lock released")
+
+    def _encode_forced_narration(duration_needed):
+        forced_src = _render_forced_narration_image(duration_needed)
+        if not forced_src:
+            if override_mode == "global":
+                logging.error(
+                    f"❌ GLOBAL narration image failed for segment {i} | "
+                    f"url={narration_images_config.get('globalImage')!r} | "
+                    f"NO character fallback allowed"
+                )
+            elif override_mode == "per_segment":
+                logging.error(
+                    f"❌ Per-segment narration image failed for segment {i} | "
+                    f"section={section_type} | NO character fallback allowed"
+                )
+            return None
+
+        out = _encode_narration_to_audio_length(
+            video_path=forced_src,
+            segment_audio_path=segment_audio_path,
+            duration_needed=duration_needed,
+            chunk_path=chunk_path,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            video_codec=video_codec,
+            preset_val=preset_val,
+            mute_source=True,
+            nvenc_semaphore=nvenc_semaphore,
+            segment_index=i,
+        )
+        return _maybe_apply_intro_teaser(out)
 
     try:
         character_name = segment["character"]
         segment_tag = segment.get("tag")
+        segment_text = (segment.get("text") or "").strip()
+        is_clip_segment = segment_text.startswith("[CLIP:") and segment_text.endswith("]")
 
-        # ============================================================
-        # TEXT-ONLY SEGMENT
-        # ============================================================
+        # TEXT-ONLY
         if character_name.lower() == "text":
-            logging.info(f"📝 Text-only segment {i} detected")
-
             if segment_audio_path and os.path.exists(segment_audio_path):
                 segment_audio = AudioFileClip(segment_audio_path, fps=44100)
                 duration_needed = segment_audio.duration
                 segment_audio = segment_audio.set_fps(44100).volumex(2)
             else:
-                words = len(segment['text'].split())
+                words = len(segment["text"].split())
                 duration_needed = max(3.0, words * 0.35)
                 segment_audio = None
 
-            bg_color = segment.get("text_bg_color", (178, 34, 34))
-            text_color = segment.get("text_color", "white")
-            fontsize = segment.get("text_fontsize", None)
-            fade_duration = segment.get("text_fade_duration", 0.8)
-
             text_clip = create_text_segment_with_lines(
-                text=segment['text'],
+                text=segment["text"],
                 duration=duration_needed,
                 canvas_w=canvas_w,
                 canvas_h=canvas_h,
-                bg_color=bg_color,
-                text_color=text_color,
-                fontsize=fontsize,
-                fade_duration=fade_duration
+                bg_color=segment.get("text_bg_color", (178, 34, 34)),
+                text_color=segment.get("text_color", "white"),
+                fontsize=segment.get("text_fontsize", None),
+                fade_duration=segment.get("text_fade_duration", 0.8),
             )
 
             if segment_audio:
@@ -11101,131 +13955,152 @@ def encode_video_segment(segment_info):
                 threads=4,
                 fps=30,
                 preset=preset_val,
-                ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "faststart"]
+                ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "faststart"],
             )
-
             text_clip.close()
             if segment_audio:
                 segment_audio.close()
+            return _maybe_apply_intro_teaser(chunk_path)
 
-            logging.info(f"✅ Text segment {i} completed: {chunk_path}")
-            return chunk_path
+        # CLIP SEGMENT
+        if is_clip_segment:
+            if not segment_tag:
+                logging.error(f"❌ CLIP segment {i}: no tag")
+                return None
 
-        # ============================================================
-        # COMMENTARY MODE WITH NARRATION
-        # ============================================================
+            tagged_media = [
+                m for m in media_pool
+                if m["character"] == character_name and m.get("tag") == segment_tag
+            ]
+            if not tagged_media or tagged_media[0]["type"] != "video":
+                logging.error(f"❌ CLIP segment {i}: tagged video not found")
+                return None
+
+            selected = tagged_media[0]
+            out = _encode_clip_segment(
+                src=selected["path"],
+                chunk_path=chunk_path,
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                video_codec=video_codec,
+                preset_val=preset_val,
+                mute=selected.get("mute", False),
+                nvenc_semaphore=nvenc_semaphore,
+                segment_index=i,
+            )
+            return _maybe_apply_intro_teaser(out)
+
+        # COMMENTARY WITH NARRATION
         if mode in ["commentary", "regenerate_commentary"] and segment_audio_path is not None:
             segment_audio = AudioFileClip(segment_audio_path, fps=44100)
             duration_needed = segment_audio.duration
-            segment_audio = segment_audio.set_fps(44100).volumex(2)
+            segment_audio.close()
+            segment_audio = None
+
+            if _full_avatar_skip_narration_media() and not is_clip_segment:
+                placeholder = _encode_full_avatar_narration_placeholder(duration_needed)
+                if placeholder:
+                    return _maybe_apply_intro_teaser(placeholder)
+
+            if override_mode == "global" and not has_segment_tag:
+                return _encode_forced_narration(duration_needed)
+
+            if override_mode == "per_segment" and not has_segment_tag:
+                return _encode_forced_narration(duration_needed)
+
 
             if segment_tag:
                 tagged_media = [
                     m for m in media_pool
                     if m["character"] == character_name and m.get("tag") == segment_tag
                 ]
-                if tagged_media:
+                if tagged_media and tagged_media[0]["type"] == "video":
                     selected = tagged_media[0]
-                    if selected["type"] == "video":
-                        overlay_avatar_with_audio(
-                            resized_clip=selected["path"],
-                            avatar_path="avatar.mp4",
-                            audio_path=segment_audio_path,
-                            output_path=chunk_path,
-                            avatar_active=avatar_active
-                        )
-                        return chunk_path
+                    out = _encode_narration_to_audio_length(
+                        video_path=selected["path"],
+                        segment_audio_path=segment_audio_path,
+                        duration_needed=duration_needed,
+                        chunk_path=chunk_path,
+                        canvas_w=canvas_w,
+                        canvas_h=canvas_h,
+                        video_codec=video_codec,
+                        preset_val=preset_val,
+                        mute_source=True,
+                        nvenc_semaphore=nvenc_semaphore,
+                        segment_index=i,
+                    )
+                    if out:
+                        logging.info(f"✅ Tagged narration segment {i}: {out}")
+                        return _maybe_apply_intro_teaser(out)
 
-            logging.info(f"🔁 No tag — running best-media fallback for segment {i}")
+            logging.info(f"🔁 best-media fallback for segment {i}")
             reset_overlay_usage_for_new_clip()
 
             selected_media = find_best_media_combination(
                 media_pool, segment, character_name, duration_needed,
                 used_media_dict, media_lock, mode, i,
-                script_context, prev_segments, whisk_shared_state
+                script_context, prev_segments, whisk_shared_state,
             )
-
             if not selected_media:
-                logging.error(f"❌ No fallback media for segment {i}")
                 return None
 
-            temp_clip_path = os.path.join(chunk_folder, f"temp_clip_{i}_{uuid.uuid4()}.mp4")
-            processed_clips = []
-            corrupt_clips_count = 0
+            logging.info(
+                f"🎞️ Segment {i}: encoding {len(selected_media)} media clip(s) to chunk..."
+            )
 
+            processed_clips = []
             for item_idx, item in enumerate(selected_media):
                 media = item["media"]
                 dur = item["duration"]
                 clip_output = os.path.join(chunk_folder, f"clip_{i}_{item_idx}_{uuid.uuid4()}.mp4")
-                clip_created = False
 
-                try:
-                    if media["type"] == "video":
-                        video_path = media["path"]
+                if media["type"] == "video":
+                    subclip_dur = min(dur, media["duration"])
+                    cmd = [
+                        "ffmpeg", "-y", "-i", media["path"],
+                        "-t", str(round(subclip_dur, 4)),
+                        "-vf",
+                        (
+                            f"fps=30,setpts=PTS-STARTPTS,"
+                            f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2"
+                        ),
+                        "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+                        "-r", "30", "-vsync", "cfr",
+                        "-avoid_negative_ts", "make_zero",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        "-an",
+                        clip_output,
+                    ]
+                    r = _run_ffmpeg(cmd, f"clip {item_idx} trim/scale")
+                    if not r or r.returncode != 0:
+                        continue
+                    processed_clips.append(clip_output)
+                else:
+                    _kb_locked = _kenburns_needs_gpu_lock()
+                    if _kb_locked:
+                        _acquire_gpu_lock(
+                            gpu_semaphore, f"Segment {i} clip {item_idx}"
+                        )
+                    logging.info(
+                        f"🎬 Segment {i} clip {item_idx}: Ken Burns..."
+                    )
+                    try:
+                        from gpu_kenburns_simple import (
+                            get_secondary_effect,
+                            get_motion_speed,
+                        )
 
-                        if not os.path.exists(video_path):
-                            raise ValueError(f"Video file missing: {video_path}")
-                        file_size = os.path.getsize(video_path)
-                        if file_size < 10000:
-                            raise ValueError(f"Video file too small: {file_size} bytes")
-
-                        test_clip = VideoFileClip(video_path)
-                        test_duration = test_clip.duration
-                        test_w = test_clip.w
-                        test_h = test_clip.h
-                        test_clip.close()
-
-                        if test_duration <= 0:
-                            raise ValueError(f"Video has zero duration")
-                        if test_w <= 0 or test_h <= 0:
-                            raise ValueError(f"Invalid dimensions: {test_w}x{test_h}")
-
-                        subclip_dur = min(dur, media["duration"])
-
-                        cmd = [
-                            'ffmpeg', '-y',
-                            '-i', video_path,
-                            '-t', str(round(subclip_dur, 4)),
-                            '-vf', f'fps=30,scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,'
-                                   f'pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2',
-                            '-c:v', video_codec, '-preset', preset_val,
-                            '-r', '30', '-vsync', 'cfr',
-                            '-avoid_negative_ts', 'make_zero',
-                            '-g', '30', '-bf', '0',
-                        ]
-                        if media.get("mute", False):
-                            cmd.extend(['-an'])
-                        else:
-                            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100'])
-                        cmd.extend(['-pix_fmt', 'yuv420p', '-movflags', 'faststart', clip_output])
-
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        if result.returncode != 0:
-                            raise RuntimeError(f"FFmpeg video encoding failed: {result.stderr[-500:]}")
-
-                        clip_created = True
-                        logging.info(f"🎥 Video clip {item_idx + 1}: {os.path.basename(video_path)} ({dur:.2f}s)")
-
-                    else:
-                        # ------------------------------------------------
-                        # IMAGE — GPU render with timeout (COMMENTARY MODE)
-                        # ------------------------------------------------
-                        from gpu_kenburns_simple import get_secondary_effect, get_motion_speed
-
-                        _primary_effect  = effect_assignment["primary_effect"]
-                        _video_seed      = effect_assignment["video_seed"]
+                        _primary_effect = effect_assignment["primary_effect"]
+                        _video_seed = effect_assignment["video_seed"]
                         _global_clip_idx = effect_assignment["global_clip_idx"]
-
-                        if item_idx == 0:
-                            _chosen_effect = _primary_effect
-                        else:
-                            _chosen_effect = get_secondary_effect(
-                                primary_effect=_primary_effect,
-                                item_idx=item_idx,
-                                global_clip_idx=_global_clip_idx,
-                                video_seed=_video_seed,
-                            )
-
+                        _chosen_effect = _primary_effect if item_idx == 0 else get_secondary_effect(
+                            primary_effect=_primary_effect,
+                            item_idx=item_idx,
+                            global_clip_idx=_global_clip_idx,
+                            video_seed=_video_seed,
+                        )
                         _speed = get_motion_speed(
                             duration=dur,
                             segment_text=segment.get("text", ""),
@@ -11233,22 +14108,15 @@ def encode_video_segment(segment_info):
                             segment_index=_global_clip_idx,
                             video_seed=_video_seed,
                         )
-
-                        _clip_output = clip_output
-                        _image_path  = media["path"]
-
-                        # ✅ head_freeze_sec only applies to first image
-                        # of the segment (item_idx == 0).
-                        # Mid-segment images (item_idx > 0) start KB immediately.
                         _freeze = head_freeze_sec if item_idx == 0 else 0.0
 
-                        def _render_commentary():
+                        def _render():
                             return create_image_video_with_effects(
-                                image_path=_image_path,
+                                image_path=media["path"],
                                 duration=dur,
                                 canvas_w=canvas_w,
                                 canvas_h=canvas_h,
-                                output_path=_clip_output,
+                                output_path=clip_output,
                                 mode=mode,
                                 index=_global_clip_idx,
                                 kenburns_enabled=CURRENT_KENBURNS_ENABLED,
@@ -11257,337 +14125,168 @@ def encode_video_segment(segment_info):
                                 effect_override=_chosen_effect,
                                 speed_override=_speed,
                                 segment_text=segment.get("text", ""),
-                                head_freeze_sec=_freeze,  # ✅ NEW
+                                head_freeze_sec=_freeze,
+                                video_seed=_video_seed,
+                                nvenc_semaphore=nvenc_semaphore,
                             )
 
-                        _gpu_acquired = False
-                        try:
-                            logging.info(f"🔒 Seg {i} item {item_idx}: acquiring gpu_semaphore...")
-                            gpu_semaphore.acquire()
-                            _gpu_acquired = True
-                            logging.info(f"🟢 Seg {i} item {item_idx}: gpu_semaphore acquired")
-
-                            render_result, render_error = _gpu_render_with_timeout(_render_commentary, timeout=600)
-
-                            if render_error is not None:
-                                raise render_error
-
-                            clip_output = render_result
-                            clip_created = True
-                            logging.info(f"🖼️ Image clip {item_idx + 1}: {os.path.basename(media['path'])} ({dur:.2f}s)")
-
-                        finally:
-                            if _gpu_acquired:
-                                gpu_semaphore.release()
-                                logging.info(f"🔓 Seg {i} item {item_idx}: gpu_semaphore released")
-
-                except Exception as e:
-                    corrupt_clips_count += 1
-                    logging.error(f"❌ Clip {item_idx + 1}/{len(selected_media)} FAILED: {e}")
-                    logging.warning(f"🎬 Replacing with black frame placeholder ({dur:.2f}s)")
-
-                    try:
-                        cmd = [
-                            'ffmpeg', '-y', '-f', 'lavfi',
-                            '-i', f'color=c=black:s={canvas_w}x{canvas_h}:d={round(dur, 4)}:r=30',
-                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                            '-preset', 'ultrafast', clip_output
-                        ]
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        if result.returncode != 0:
-                            raise RuntimeError("FFmpeg black frame failed")
-                        clip_created = True
-                        logging.info(f"✅ Black frame replacement created for clip {item_idx + 1}")
-
-                    except Exception as fallback_err:
-                        logging.error(f"💀 Black frame fallback also failed: {fallback_err}")
-                        try:
-                            import numpy as np
-                            black_array = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8) + 10
-                            frame_bytes = black_array.tobytes()
-                            total_frames = int(dur * 30)
-                            cmd = [
-                                'ffmpeg', '-y',
-                                '-f', 'rawvideo', '-vcodec', 'rawvideo',
-                                '-s', f'{canvas_w}x{canvas_h}',
-                                '-pix_fmt', 'rgb24', '-r', '30',
-                                '-i', '-',
-                                '-t', str(round(dur, 4)),
-                                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                                '-preset', 'ultrafast', clip_output
-                            ]
-                            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                                    stdout=subprocess.DEVNULL,
-                                                    stderr=subprocess.DEVNULL)
-                            for _ in range(total_frames):
-                                proc.stdin.write(frame_bytes)
-                            proc.stdin.close()
-                            proc.wait()
-                            if proc.returncode == 0:
-                                clip_created = True
-                                logging.info(f"✅ Numpy emergency black clip created for clip {item_idx + 1}")
-                            else:
-                                clip_created = False
-                        except Exception as emergency_err:
-                            logging.critical(f"💥 All fallbacks failed for clip {item_idx + 1}: {emergency_err}")
-                            clip_created = False
-
-                if clip_created and os.path.exists(clip_output):
-                    processed_clips.append(clip_output)
-                else:
-                    logging.critical(f"💥 Could not create ANY clip for item {item_idx + 1}")
+                        render_result = _render()
+                        processed_clips.append(render_result)
+                    finally:
+                        if _kb_locked:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            gpu_semaphore.release()
+                            logging.info(
+                                f"🔓 Segment {i} clip {item_idx}: GPU slot released"
+                            )
 
             if not processed_clips:
-                logging.error(f"❌ No valid clips for segment {i} - ALL clips failed")
-                raise RuntimeError(f"All clips failed for segment {i}")
-
-            if corrupt_clips_count > 0:
-                logging.warning(f"⚠️ Segment {i}: {corrupt_clips_count}/{len(selected_media)} clips replaced with black frames")
-
-            # CONCAT clips to temp path
-            if CURRENT_STORYBOARD_ENABLED and len(processed_clips) > 1:
-                inputs = []
-                for cp in processed_clips:
-                    inputs.extend(['-i', cp])
-
-                durations = []
-                for cp in processed_clips:
-                    p = subprocess.run(
-                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                         '-of', 'default=noprint_wrappers=1:nokey=1', cp],
-                        capture_output=True, text=True
-                    )
-                    durations.append(float(p.stdout.strip()))
-
-                transition_duration = 0.5
-                filter_complex = ""
-                offset = 0.0
-
-                for idx in range(len(processed_clips) - 1):
-                    if idx == 0:
-                        offset = durations[0] - transition_duration
-                        filter_complex += (
-                            f"[0:v][1:v]xfade=transition=fade:"
-                            f"duration={transition_duration}:"
-                            f"offset={round(offset, 4)}[v{idx}];"
-                        )
-                    else:
-                        offset += durations[idx] - transition_duration
-                        filter_complex += (
-                            f"[v{idx-1}][{idx+1}:v]xfade=transition=fade:"
-                            f"duration={transition_duration}:"
-                            f"offset={round(offset, 4)}[v{idx}];"
-                        )
-
-                final_label = f"[v{len(processed_clips) - 2}]" if len(processed_clips) > 2 else "[v0]"
-                cmd = [
-                    'ffmpeg', '-y',
-                    *inputs,
-                    '-filter_complex', filter_complex,
-                    '-map', final_label,
-                    '-c:v', video_codec, '-preset', preset_val,
-                    '-t', str(round(duration_needed, 4)),
-                    '-pix_fmt', 'yuv420p',
-                    '-movflags', 'faststart',
-                    temp_clip_path
-                ]
-            elif len(processed_clips) == 1:
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-i', processed_clips[0],
-                    '-c:v', video_codec, '-preset', preset_val,
-                    '-t', str(round(duration_needed, 4)),
-                    '-pix_fmt', 'yuv420p',
-                    '-movflags', 'faststart',
-                    temp_clip_path
-                ]
-            else:
-                concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
-                with open(concat_list_path, 'w') as f:
-                    for cp in processed_clips:
-                        f.write(f"file '{os.path.abspath(cp)}'\n")
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-f', 'concat', '-safe', '0',
-                    '-i', concat_list_path,
-                    '-c:v', video_codec, '-preset', preset_val,
-                    '-t', str(round(duration_needed, 4)),
-                    '-pix_fmt', 'yuv420p',
-                    '-movflags', 'faststart',
-                    temp_clip_path
-                ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logging.error(f"FFmpeg concat STDERR: {result.stderr[-1000:]}")
                 return None
 
-            for cp in processed_clips:
-                if os.path.exists(cp):
-                    os.remove(cp)
+            if len(processed_clips) == 1:
+                content_src = processed_clips[0]
+            else:
+                concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
+                with open(concat_list_path, "w") as f:
+                    for cp in processed_clips:
+                        f.write(f"file '{os.path.abspath(cp).replace(os.sep, '/')}'\n")
+                content_src = os.path.join(chunk_folder, f"merged_{i}_{uuid.uuid4()}.mp4")
+                r = _run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", concat_list_path,
+                    "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    content_src,
+                ], "intra-segment concat")
+                if not r or r.returncode != 0:
+                    return None
 
-            final_overlayed_path = overlay_avatar_with_audio(
-                resized_clip=temp_clip_path,
-                avatar_path="avatar.mp4",
-                audio_path=segment_audio_path,
-                output_path=chunk_path,
-                avatar_active=avatar_active
+            logging.info(f"🎞️ Segment {i}: muxing narration audio ({duration_needed:.2f}s)...")
+            out = _encode_narration_to_audio_length(
+                video_path=content_src,
+                segment_audio_path=segment_audio_path,
+                duration_needed=duration_needed,
+                chunk_path=chunk_path,
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                video_codec=video_codec,
+                preset_val=preset_val,
+                mute_source=True,
+                nvenc_semaphore=nvenc_semaphore,
+                segment_index=i,
             )
 
-            if os.path.exists(temp_clip_path):
-                os.remove(temp_clip_path)
+            for cp in processed_clips:
+                try:
+                    if os.path.exists(cp):
+                        os.remove(cp)
+                except Exception:
+                    pass
 
-            return final_overlayed_path
+            return _maybe_apply_intro_teaser(out)
 
-        # ============================================================
-        # COMMENTARY WITHOUT NARRATION
-        # ============================================================
+        # COMMENTARY CLIP WITHOUT NARRATION AUDIO
         if mode in ["commentary", "regenerate_commentary"] and segment_audio_path is None and segment_tag:
             tagged_media = [
                 m for m in media_pool
                 if m["character"] == character_name and m.get("tag") == segment_tag
             ]
-            if tagged_media:
+            if tagged_media and tagged_media[0]["type"] == "video":
                 selected = tagged_media[0]
-                if selected["type"] == "video":
-                    overlay_avatar_no_audio(
-                        selected["path"],
-                        f"channel_media/{avatar}",
-                        f"channel_media/{background_video}",
-                        chunk_path,
-                        segment_tag,
-                        media_pool=media_pool,
-                        character_name=character_name
-                    )
-                    return chunk_path
+                out = _encode_clip_segment(
+                    src=selected["path"],
+                    chunk_path=chunk_path,
+                    canvas_w=canvas_w,
+                    canvas_h=canvas_h,
+                    video_codec=video_codec,
+                    preset_val=preset_val,
+                    mute=selected.get("mute", False),
+                    nvenc_semaphore=nvenc_semaphore,
+                    segment_index=i,
+                )
+                return _maybe_apply_intro_teaser(out)
 
-        # ============================================================
-        # NON-COMMENTARY WITH TAG BUT NO AUDIO
-        # ============================================================
-        if segment_audio_path is None and segment_tag:
-            tagged_media = [
-                m for m in media_pool
-                if m["character"] == character_name and m.get("tag") == segment_tag
-            ]
-            if tagged_media:
-                selected = tagged_media[0]
-                if selected["type"] == "video":
-                    full_video = VideoFileClip(selected["path"])
-                    duration = full_video.duration
-                    audio = full_video.audio.set_fps(44100)
-
-                    logging.info(f"⏱️ Duration {duration:.2f}s — encoding directly without overlay.")
-                    final_clip = full_video.set_audio(audio.set_duration(duration))
-                    final_clip.write_videofile(
-                        chunk_path,
-                        codec=video_codec,
-                        audio_codec="aac",
-                        audio_fps=44100,
-                        threads=4,
-                        fps=30,
-                        ffmpeg_params=["-pix_fmt", "yuv420p", "-preset", preset_val,
-                                       "-movflags", "faststart", "-shortest"]
-                    )
-                    full_video.close()
-                    return chunk_path
-
-        # ============================================================
-        # DEFAULT: NORMAL AUDIO-BASED SEGMENT
-        # ============================================================
+        # DEFAULT AUDIO-BASED
         if not segment_audio_path or not os.path.exists(segment_audio_path):
-            logging.error(f"❌ No audio file for segment {i}")
             return None
 
         segment_audio = AudioFileClip(segment_audio_path, fps=44100)
         duration_needed = segment_audio.duration
-        segment_audio = segment_audio.set_fps(44100).volumex(2)
+        segment_audio.close()
+        segment_audio = None
+
+        if _full_avatar_skip_narration_media() and not is_clip_segment:
+            placeholder = _encode_full_avatar_narration_placeholder(duration_needed)
+            if placeholder:
+                return _maybe_apply_intro_teaser(placeholder)
+
+        if override_mode == "global" and not has_segment_tag:
+            return _encode_forced_narration(duration_needed)
+        
+        if override_mode == "per_segment" and not has_segment_tag:
+            return _encode_forced_narration(duration_needed)
+        
+     
 
         selected_media = find_best_media_combination(
             media_pool, segment, character_name,
             duration_needed, used_media_dict,
-            media_lock, mode, i, script_context, prev_segments, whisk_shared_state
+            media_lock, mode, i, script_context, prev_segments, whisk_shared_state,
         )
-
         if not selected_media:
-            logging.error(f"❌ No media selected for segment {i}")
             return None
 
-        processed_clips = []
-        corrupt_clips_count = 0
+        logging.info(
+            f"🎞️ Segment {i}: encoding {len(selected_media)} media clip(s) to chunk..."
+        )
 
+        processed_clips = []
         for item_idx, item in enumerate(selected_media):
             media = item["media"]
             dur = item["duration"]
             clip_output = os.path.join(chunk_folder, f"clip_{i}_{item_idx}_{uuid.uuid4()}.mp4")
-            clip_created = False
 
-            try:
-                if media["type"] == "video":
-                    video_path = media["path"]
-
-                    if not os.path.exists(video_path):
-                        raise ValueError(f"Video file missing: {video_path}")
-                    file_size = os.path.getsize(video_path)
-                    if file_size < 10000:
-                        raise ValueError(f"Video file too small: {file_size} bytes")
-
-                    test_clip = VideoFileClip(video_path)
-                    test_duration = test_clip.duration
-                    test_w = test_clip.w
-                    test_h = test_clip.h
-                    test_clip.close()
-
-                    if test_duration <= 0:
-                        raise ValueError(f"Video has zero duration")
-                    if test_w <= 0 or test_h <= 0:
-                        raise ValueError(f"Invalid dimensions: {test_w}x{test_h}")
-
-                    subclip_dur = min(dur, media["duration"])
-
-                    cmd = [
-                        'ffmpeg', '-y',
-                        '-i', video_path,
-                        '-t', str(round(subclip_dur, 4)),
-                        '-vf', f'fps=30,scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,'
-                               f'pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2',
-                        '-c:v', video_codec, '-preset', preset_val,
-                        '-r', '30', '-vsync', 'cfr',
-                        '-avoid_negative_ts', 'make_zero',
-                        '-g', '30', '-bf', '0',
-                    ]
-                    if media.get("mute", False):
-                        cmd.extend(['-an'])
-                    else:
-                        cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100'])
-                    cmd.extend(['-pix_fmt', 'yuv420p', '-movflags', 'faststart', clip_output])
-
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        raise RuntimeError(f"FFmpeg video encoding failed: {result.stderr[-500:]}")
-
-                    clip_created = True
-                    logging.info(f"🎥 Video clip {item_idx + 1}: {os.path.basename(video_path)} ({dur:.2f}s)")
-
-                else:
-                    # ------------------------------------------------
-                    # IMAGE — GPU render with timeout (DEFAULT MODE)
-                    # ------------------------------------------------
+            if media["type"] == "video":
+                subclip_dur = min(dur, media["duration"])
+                cmd = [
+                    "ffmpeg", "-y", "-i", media["path"],
+                    "-t", str(round(subclip_dur, 4)),
+                    "-vf",
+                    (
+                        f"fps=30,setpts=PTS-STARTPTS,"
+                        f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2"
+                    ),
+                    "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+                    "-r", "30", "-vsync", "cfr",
+                    "-avoid_negative_ts", "make_zero",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-an",
+                    clip_output,
+                ]
+                r = _run_ffmpeg(cmd, f"clip {item_idx} trim/scale")
+                if r and r.returncode == 0:
+                    processed_clips.append(clip_output)
+            else:
+                _kb_locked = _kenburns_needs_gpu_lock()
+                if _kb_locked:
+                    _acquire_gpu_lock(gpu_semaphore, f"Segment {i} clip {item_idx}")
+                logging.info(f"🎬 Segment {i} clip {item_idx}: Ken Burns...")
+                try:
                     from gpu_kenburns_simple import get_secondary_effect, get_motion_speed
 
-                    _primary_effect  = effect_assignment["primary_effect"]
-                    _video_seed      = effect_assignment["video_seed"]
+                    _primary_effect = effect_assignment["primary_effect"]
+                    _video_seed = effect_assignment["video_seed"]
                     _global_clip_idx = effect_assignment["global_clip_idx"]
-
-                    if item_idx == 0:
-                        _chosen_effect = _primary_effect
-                    else:
-                        _chosen_effect = get_secondary_effect(
-                            primary_effect=_primary_effect,
-                            item_idx=item_idx,
-                            global_clip_idx=_global_clip_idx,
-                            video_seed=_video_seed,
-                        )
-
+                    _chosen_effect = _primary_effect if item_idx == 0 else get_secondary_effect(
+                        primary_effect=_primary_effect,
+                        item_idx=item_idx,
+                        global_clip_idx=_global_clip_idx,
+                        video_seed=_video_seed,
+                    )
                     _speed = get_motion_speed(
                         duration=dur,
                         segment_text=segment.get("text", ""),
@@ -11595,22 +14294,15 @@ def encode_video_segment(segment_info):
                         segment_index=_global_clip_idx,
                         video_seed=_video_seed,
                     )
-
-                    _clip_output = clip_output
-                    _image_path  = media["path"]
-
-                    # ✅ head_freeze_sec only applies to first image
-                    # of the segment (item_idx == 0).
-                    # Mid-segment images (item_idx > 0) start KB immediately.
                     _freeze = head_freeze_sec if item_idx == 0 else 0.0
 
                     def _render_default():
                         return create_image_video_with_effects(
-                            image_path=_image_path,
+                            image_path=media["path"],
                             duration=dur,
                             canvas_w=canvas_w,
                             canvas_h=canvas_h,
-                            output_path=_clip_output,
+                            output_path=clip_output,
                             mode=mode,
                             index=_global_clip_idx,
                             kenburns_enabled=CURRENT_KENBURNS_ENABLED,
@@ -11619,361 +14311,78 @@ def encode_video_segment(segment_info):
                             effect_override=_chosen_effect,
                             speed_override=_speed,
                             segment_text=segment.get("text", ""),
-                            head_freeze_sec=_freeze,  # ✅ NEW
+                            head_freeze_sec=_freeze,
+                            video_seed=_video_seed,
+                            nvenc_semaphore=nvenc_semaphore,
                         )
 
-                    _gpu_acquired = False
-                    try:
-                        logging.info(f"🔒 Seg {i} item {item_idx}: acquiring gpu_semaphore...")
-                        gpu_semaphore.acquire()
-                        _gpu_acquired = True
-                        logging.info(f"🟢 Seg {i} item {item_idx}: gpu_semaphore acquired")
-
-                        render_result, render_error = _gpu_render_with_timeout(_render_default, timeout=600)
-
-                        if render_error is not None:
-                            raise render_error
-
-                        clip_output = render_result
-                        clip_created = True
-                        logging.info(f"🖼️ Image clip {item_idx + 1}: {os.path.basename(media['path'])} ({dur:.2f}s)")
-
-                    finally:
-                        if _gpu_acquired:
-                            gpu_semaphore.release()
-                            logging.info(f"🔓 Seg {i} item {item_idx}: gpu_semaphore released")
-
-            except Exception as e:
-                corrupt_clips_count += 1
-                logging.error(f"❌ Clip {item_idx + 1}/{len(selected_media)} FAILED: {e}")
-                logging.warning(f"🎬 Replacing with black frame placeholder ({dur:.2f}s)")
-
-                try:
-                    cmd = [
-                        'ffmpeg', '-y', '-f', 'lavfi',
-                        '-i', f'color=c=black:s={canvas_w}x{canvas_h}:d={round(dur, 4)}:r=30',
-                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                        '-preset', 'ultrafast', clip_output
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        raise RuntimeError("FFmpeg black frame failed")
-                    clip_created = True
-                    logging.info(f"✅ Black frame replacement created for clip {item_idx + 1}")
-
-                except Exception as fallback_err:
-                    logging.error(f"💀 Black frame fallback also failed: {fallback_err}")
-                    try:
-                        import numpy as np
-                        black_array = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8) + 10
-                        frame_bytes = black_array.tobytes()
-                        total_frames = int(dur * 30)
-                        cmd = [
-                            'ffmpeg', '-y',
-                            '-f', 'rawvideo', '-vcodec', 'rawvideo',
-                            '-s', f'{canvas_w}x{canvas_h}',
-                            '-pix_fmt', 'rgb24', '-r', '30',
-                            '-i', '-',
-                            '-t', str(round(dur, 4)),
-                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                            '-preset', 'ultrafast', clip_output
-                        ]
-                        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                                stdout=subprocess.DEVNULL,
-                                                stderr=subprocess.DEVNULL)
-                        for _ in range(total_frames):
-                            proc.stdin.write(frame_bytes)
-                        proc.stdin.close()
-                        proc.wait()
-                        if proc.returncode == 0:
-                            clip_created = True
-                            logging.info(f"✅ Numpy emergency black clip created for clip {item_idx + 1}")
-                        else:
-                            clip_created = False
-                    except Exception as emergency_err:
-                        logging.critical(f"💥 All fallbacks failed for clip {item_idx + 1}: {emergency_err}")
-                        clip_created = False
-
-            if clip_created and os.path.exists(clip_output):
-                processed_clips.append(clip_output)
-            else:
-                logging.critical(f"💥 Could not create ANY clip for item {item_idx + 1}")
+                    render_result = _render_default()
+                    processed_clips.append(render_result)
+                finally:
+                    if _kb_locked:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gpu_semaphore.release()
+                        logging.info(f"🔓 Segment {i} clip {item_idx}: GPU slot released")
 
         if not processed_clips:
-            logging.error(f"❌ No valid clips for segment {i} - ALL clips failed")
-            raise RuntimeError(f"All clips failed for segment {i}")
-
-        if corrupt_clips_count > 0:
-            logging.warning(f"⚠️ Segment {i}: {corrupt_clips_count}/{len(selected_media)} clips replaced with black frames")
-
-        # FINAL ASSEMBLY
-        if CURRENT_STORYBOARD_ENABLED and len(processed_clips) > 1:
-            inputs = []
-            for cp in processed_clips:
-                inputs.extend(['-i', cp])
-            inputs.extend(['-i', segment_audio_path])
-
-            durations = []
-            for cp in processed_clips:
-                p = subprocess.run(
-                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                     '-of', 'default=noprint_wrappers=1:nokey=1', cp],
-                    capture_output=True, text=True
-                )
-                durations.append(float(p.stdout.strip()))
-
-            transition_duration = 0.5
-            filter_complex = ""
-            offset = 0.0
-
-            for idx in range(len(processed_clips) - 1):
-                if idx == 0:
-                    offset = durations[0] - transition_duration
-                    filter_complex += (
-                        f"[0:v][1:v]xfade=transition=fade:"
-                        f"duration={transition_duration}:"
-                        f"offset={round(offset, 4)}[v{idx}];"
-                    )
-                else:
-                    offset += durations[idx] - transition_duration
-                    filter_complex += (
-                        f"[v{idx-1}][{idx+1}:v]xfade=transition=fade:"
-                        f"duration={transition_duration}:"
-                        f"offset={round(offset, 4)}[v{idx}];"
-                    )
-
-            final_label = f"[v{len(processed_clips) - 2}]" if len(processed_clips) > 2 else "[v0]"
-            n_video_inputs = len(processed_clips)
-            cmd = [
-                'ffmpeg', '-y',
-                *inputs,
-                '-filter_complex', filter_complex,
-                '-map', final_label,
-                '-map', f'{n_video_inputs}:a:0',
-                '-c:v', video_codec, '-preset', preset_val,
-                '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-                '-t', str(round(duration_needed, 4)),
-                '-pix_fmt', 'yuv420p',
-                '-movflags', 'faststart',
-                chunk_path
-            ]
-
-        elif len(processed_clips) == 1:
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', processed_clips[0],
-                '-i', segment_audio_path,
-                '-c:v', video_codec, '-preset', preset_val,
-                '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-                '-map', '0:v:0', '-map', '1:a:0',
-                '-t', str(round(duration_needed, 4)),
-                '-pix_fmt', 'yuv420p',
-                '-movflags', 'faststart',
-                chunk_path
-            ]
-
-        else:
-            concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
-            with open(concat_list_path, 'w') as f:
-                for cp in processed_clips:
-                    f.write(f"file '{os.path.abspath(cp)}'\n")
-            cmd = [
-                'ffmpeg', '-y',
-                '-f', 'concat', '-safe', '0',
-                '-i', concat_list_path,
-                '-i', segment_audio_path,
-                '-c:v', video_codec, '-preset', preset_val,
-                '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-                '-map', '0:v:0', '-map', '1:a:0',
-                '-t', str(round(duration_needed, 4)),
-                '-pix_fmt', 'yuv420p',
-                '-movflags', 'faststart',
-                chunk_path
-            ]
-
-        logging.debug(f"Final encode: {' '.join(cmd[:10])}...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logging.error(f"FFmpeg final encode STDERR: {result.stderr[-1000:]}")
             return None
 
-        for cp in processed_clips:
-            if os.path.exists(cp):
-                os.remove(cp)
-        if 'concat_list_path' in locals() and os.path.exists(concat_list_path):
-            os.remove(concat_list_path)
+        if len(processed_clips) == 1:
+            content_src = processed_clips[0]
+        else:
+            concat_list_path = os.path.join(chunk_folder, f"concat_{uuid.uuid4()}.txt")
+            with open(concat_list_path, "w") as f:
+                for cp in processed_clips:
+                    f.write(f"file '{os.path.abspath(cp).replace(os.sep, '/')}'\n")
+            content_src = os.path.join(chunk_folder, f"merged_{i}_{uuid.uuid4()}.mp4")
+            r = _run_ffmpeg([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_list_path,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                content_src,
+            ], "intra-segment concat")
+            if not r or r.returncode != 0:
+                return None
 
-        segment_audio.close()
-
-        logging.info(f"✅ Segment {i} completed: {chunk_path}")
-        return chunk_path
+        logging.info(f"🎞️ Segment {i}: muxing narration audio ({duration_needed:.2f}s)...")
+        out = _encode_narration_to_audio_length(
+            video_path=content_src,
+            segment_audio_path=segment_audio_path,
+            duration_needed=duration_needed,
+            chunk_path=chunk_path,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            video_codec=video_codec,
+            preset_val=preset_val,
+            mute_source=True,
+            nvenc_semaphore=nvenc_semaphore,
+            segment_index=i,
+        )
+        return _maybe_apply_intro_teaser(out)
 
     except Exception as e:
         logging.error(f"❌ Segment {i} crashed: {e}", exc_info=True)
         return None
 
     finally:
+        if segment_audio:
+            try:
+                segment_audio.close()
+            except Exception:
+                pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
 
-# def encode_video_segment_with_retry(segment_info, max_retries=3, base_delay=3):
-#     """
-#     Retry wrapper for encode_video_segment with exponential backoff.
-#     """
-#     for attempt in range(1, max_retries + 1):
-#         try:
-#             result = encode_video_segment(segment_info)
-#             if result:
-#                 return result
-#             raise RuntimeError("Returned None or failed segment encoding")
-#         except Exception as e:
-#             logging.error(f"⚠️ Attempt {attempt}/{max_retries} failed for segment {segment_info[5]}: {e}")
-#             if attempt < max_retries:
-#                 delay = base_delay * attempt + random.uniform(0, 1)
-#                  logging.info(f"⏳ Retrying segment {segment_info[5]} in {delay:.1f}s...")
-#                 time.sleep(delay)
-#             else:
-#                 logging.error(f"🚨 Segment {segment_info[5]} permanently failed after {max_retries} attempts.")
-#                 return None
-# def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
-#     """
-#     Retry wrapper for encode_video_segment with exponential backoff.
-#     segment_info is now a LONG tuple containing orientation, storyboard, kenburns.
-#     """
-#     for attempt in range(1, max_retries + 1):
-#         try:
-#             result = encode_video_segment(segment_info)
-#             if result:
-#                 return result
+def _encode_segment_pool_worker(segment_info):
+    """Pool worker — returns (segment_index, chunk_path) for progress tracking."""
+    segment_index = segment_info[5]
+    return segment_index, encode_video_segment_with_retry(segment_info)
 
-#             raise RuntimeError("Returned None or failed segment encoding")
-
-#         except Exception as e:
-#             logging.error(f"⚠️ Attempt {attempt}/{max_retries} failed for segment {segment_info[5]}: {e}")
-
-#             if attempt < max_retries:
-#                 delay = base_delay * attempt + random.uniform(0, 1)
-#                 logging.info(f"⏳ Retrying segment {segment_info[5]} in {delay:.1f}s...")
-#                 time.sleep(delay)
-#             else:
-#                 logging.error(f"🚨 Segment {segment_info[5]} permanently failed after {max_retries} attempts.")
-#                 return None
-# def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
-#     """
-#     Retry wrapper for encode_video_segment with exponential backoff.
-#     Only creates full-segment fallback if ALL retries fail completely.
-#     Per-clip failures are handled inside encode_video_segment.
-#     """
-#     segment_index = segment_info[5]
-#     segment = segment_info[0]
-#     segment_audio_path = segment_info[2]
-#     chunk_folder = segment_info[4]
-#     orientation = segment_info[13]
-    
-#     # Determine canvas dimensions
-#     if orientation == "portrait":
-#         canvas_w, canvas_h = 1080, 1920
-#     else:
-#         canvas_w, canvas_h = 1920, 1080
-    
-#     # Determine expected duration
-#     expected_duration = 5.0
-#     if segment_audio_path and os.path.exists(segment_audio_path):
-#         try:
-#             audio_clip = AudioFileClip(segment_audio_path)
-#             expected_duration = audio_clip.duration
-#             audio_clip.close()
-#             del audio_clip
-#         except Exception as e:
-#             logging.warning(f"⚠️ Could not read audio duration: {e}")
-#             words = len(segment.get('text', '').split())
-#             expected_duration = max(3.0, words * 0.35)
-#     else:
-#         words = len(segment.get('text', '').split())
-#         expected_duration = max(3.0, words * 0.35)
-    
-#     last_error = None
-    
-#     # 🔥 RETRY LOOP
-#     for attempt in range(1, max_retries + 1):
-#         try:
-#             logging.info(f"🔄 Segment {segment_index} - Attempt {attempt}/{max_retries}")
-            
-#             result = encode_video_segment(segment_info)
-            
-#             if result and os.path.exists(result):
-#                 file_size = os.path.getsize(result)
-                
-#                 if file_size > 10000:
-#                     # Quick validation
-#                     try:
-#                         test_clip = VideoFileClip(result)
-#                         test_duration = test_clip.duration
-#                         test_clip.close()
-#                         del test_clip
-                        
-#                         if test_duration > 0:
-#                             logging.info(f"✅ Segment {segment_index} completed on attempt {attempt}")
-#                             return result
-#                         else:
-#                             logging.warning(f"⚠️ Invalid duration: {test_duration}s")
-#                             os.remove(result)
-#                             last_error = f"Invalid duration: {test_duration}s"
-#                     except Exception as e:
-#                         logging.warning(f"⚠️ Validation failed: {e}")
-#                         if os.path.exists(result):
-#                             os.remove(result)
-#                         last_error = f"Validation error: {str(e)}"
-#                 else:
-#                     logging.warning(f"⚠️ Output too small: {file_size} bytes")
-#                     os.remove(result)
-#                     last_error = f"File too small: {file_size} bytes"
-#             else:
-#                 last_error = "encode_video_segment returned None"
-#                 raise RuntimeError(last_error)
-
-#         except Exception as e:
-#             last_error = str(e)
-#             logging.error(f"⚠️ Attempt {attempt}/{max_retries} failed: {e}")
-
-#             if attempt < max_retries:
-#                 delay = base_delay * attempt + random.uniform(0, 1)
-#                 logging.info(f"⏳ Retrying in {delay:.1f}s...")
-#                 time.sleep(delay)
-                
-#                 if torch.cuda.is_available():
-#                     torch.cuda.empty_cache()
-#                 gc.collect()
-    
-#     # 🔥 ALL RETRIES FAILED - CREATE FULL SEGMENT FALLBACK
-#     logging.error(f"💀 All {max_retries} attempts failed for segment {segment_index}")
-#     logging.warning(f"🎬 Creating FULL SEGMENT BLACK PLACEHOLDER")
-#     logging.error(f"   Last error: {last_error}")
-    
-#     try:
-#         fallback_path = create_full_segment_fallback(
-#             duration=expected_duration,
-#             canvas_w=canvas_w,
-#             canvas_h=canvas_h,
-#             segment_index=segment_index,
-#             audio_path=segment_audio_path,
-#             chunk_folder=chunk_folder,
-#             reason=last_error
-#         )
-        
-#         if fallback_path and os.path.exists(fallback_path):
-#             logging.info(f"✅ Full segment fallback created for segment {segment_index}")
-#             return fallback_path
-#         else:
-#             logging.critical(f"🚨 Fallback creation failed")
-#             return None
-            
-#     except Exception as fallback_error:
-#         logging.critical(f"💥 Fallback crashed: {fallback_error}")
-#         logging.error(traceback.format_exc())
-#         return None
 
 def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
     """
@@ -12028,10 +14437,7 @@ def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
 
                 if file_size > 10000:
                     try:
-                        test_clip = VideoFileClip(result)
-                        test_duration = test_clip.duration
-                        test_clip.close()
-                        del test_clip
+                        test_duration = _probe_video_duration_safe(result)
 
                         if test_duration > 0:
                             logging.info(f"✅ Segment {segment_index} completed on attempt {attempt}")
@@ -12040,6 +14446,11 @@ def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
                             logging.warning(f"⚠️ Invalid duration: {test_duration}s")
                             os.remove(result)
                             last_error = f"Invalid duration: {test_duration}s"
+                    except TimeoutError as e:
+                        logging.warning(f"⚠️ Validation timed out: {e}")
+                        if os.path.exists(result):
+                            os.remove(result)
+                        last_error = str(e)
                     except Exception as e:
                         logging.warning(f"⚠️ Validation failed: {e}")
                         if os.path.exists(result):
@@ -12151,6 +14562,7 @@ def encode_video_segment_with_retry(segment_info, max_retries=5, base_delay=3):
     # Nothing worked at all
     logging.critical(f"🔴 FATAL: Segment {segment_index} could not be created by any method. Returning None.")
     return None
+
 
 
 def merge_audios(audio_paths, output_path=None):
@@ -12391,44 +14803,6 @@ def add_background_music(video_path, background, volume=1):
     return video_path
 
 
-
-
-from datetime import timedelta
-import whisper
-import os
-import re
-import shutil
-import subprocess
-import logging
-import traceback
-from moviepy.editor import AudioFileClip
-
-def format_timestamp(seconds):
-    td = timedelta(seconds=int(seconds))
-    ms = int((seconds - int(seconds)) * 1000)
-    return f"{str(td)},{ms:03}"
-
-
-def generate_srt_from_video(video_path, srt_path="output.srt", model_size="base"):
-    temp_audio = "temp_audio.mp3"
-    logging.info("🔧 Extracting audio from final video...")
-    subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", temp_audio], check=True)
-
-    logging.info("🧠 Transcribing audio using Whisper...")
-    model = whisper.load_model(model_size)
-    result = model.transcribe(temp_audio, fp16=False)
-
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for seg in result["segments"]:
-            idx = seg["id"] + 1
-            start = format_timestamp(seg["start"])
-            end = format_timestamp(seg["end"])
-            text = seg["text"].strip()
-            f.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
-
-    os.remove(temp_audio)
-    logging.info(f"✅ Subtitles saved to {srt_path}")
-    return srt_path
 
 
 # Font mapping for FFmpeg compatibility
@@ -13028,72 +15402,6 @@ def compute_segment_durations(segment_audio_paths):
     return durations
 
 
-# def assign_timeline_phases(segments, segment_audio_paths, intro_sec=600, finale_sec=600):
-#     """
-#     Rules:
-#     - Intro: pack whole segments from start; the segment that crosses 600s stays Intro.
-#     - Finale: pack whole segments from end; the segment that crosses 600s stays Finale.
-#     - No overlap: if they collide, Intro keeps earlier indices; Finale keeps later; Body is the gap (or empty).
-#     Adds per-segment:
-#       seg["duration_needed"], seg["phase"] in {"intro","body","finale"}, seg["pexels_required"] bool
-#     """
-#     n = len(segments)
-#     durs = compute_segment_durations(segment_audio_paths)
-#     for i, seg in enumerate(segments):
-#         seg["duration_needed"] = durs[i]
-
-#     total = sum(durs)
-
-#     # --- Intro indices ---
-#     intro_idxs = []
-#     cum = 0.0
-#     for i, dur in enumerate(durs):
-#         if cum >= intro_sec:
-#             break
-#         intro_idxs.append(i)
-#         cum += dur
-#         if cum >= intro_sec:
-#             # this segment that pushed us over stays in intro by rule
-#             break
-
-#     # --- Finale indices (from end) ---
-#     finale_idxs = []
-#     cum = 0.0
-#     for j in range(n - 1, -1, -1):
-#         if j in intro_idxs:
-#             break  # prevent overlap, intro has priority on earlier side
-#         if cum >= finale_sec:
-#             break
-#         finale_idxs.append(j)
-#         cum += durs[j]
-#         if cum >= finale_sec:
-#             # this segment that pushed us over stays in finale by rule
-#             break
-#     finale_idxs = set(finale_idxs)
-
-#     # If there’s still overlap due to very short total, trim finale to be strictly after intro
-#     if intro_idxs:
-#         last_intro = max(intro_idxs)
-#     else:
-#         last_intro = -1
-#     finale_idxs = {j for j in finale_idxs if j > last_intro}
-
-#     # --- Assign phases ---
-#     for i, seg in enumerate(segments):
-#         if i in intro_idxs:
-#             seg["phase"] = "intro"
-#             # seg["pexels_required"] = True     # Pexels videos
-#             seg["imagefx_required"] = True     # Pexels videos
-#         elif i in finale_idxs:
-#             seg["phase"] = "finale"
-#             # seg["pexels_required"] = True     # Pexels videos
-#             seg["imagefx_required"] = True
-#         else:
-#             seg["phase"] = "body"
-#             # seg["pexels_image_required"] = True    # Strictly images from media library
-#             seg["imagefx_required"] = True
-#     return segments
-
 def assign_timeline_phases(
     segments,
     segment_audio_paths,
@@ -13117,6 +15425,7 @@ def assign_timeline_phases(
       
       If whisk_required: seg["character_id"] is added
       Optional seg["ai_prompt"] when AI Image is chosen and a prompt is provided.
+      Use style key "space" for space-documentary painterly mode (visual bible + layered prompts).
     """
     def select_flags_for_type(media_type: str, character_id: str = None):
         flags = {
@@ -13189,1855 +15498,2499 @@ def assign_timeline_phases(
 
     return segments
 
-# def create_video(phase_media, mode, avatar, background_video, background, user_id, section_type,
-#                  clip_data_list=None, image_data_list=None,
-#                  segment_audio_paths=None, narration_text=None, characters=None,
-#                  vid_segments=None, asset_folder=None, output_dir=OUTPUT):
-
-#     os.makedirs(output_dir, exist_ok=True)
-
-#     if mode in ["create", "commentary", "original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#         if "-" in (asset_folder or ""):
-#             intro_timestamp, body_timestamp = asset_folder.split("-")
-#             section_dir = os.path.join(TEMP_DIR, intro_timestamp if section_type == "intro" else body_timestamp)
-#         else:
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-
-#     output_path = os.path.join(output_dir, f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
-
-#     if mode == "original":
-#         media_data = phase_media["phase_media"]
-#         vid_segments = assign_timeline_phases(
-#             vid_segments, segment_audio_paths, media_data,
-#             intro_sec=phase_media["intro_sec"], finale_sec=phase_media["finale_sec"]
-#         )
-
-#     try:
-#         media_pool = []
-
-#         if mode in ["create", "commentary", "original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             video_results = download_video_clips_in_parallel(clip_data_list, section_dir, user_id)
-#             for result in video_results:
-#                 try:
-#                     clip = VideoFileClip(result["path"])
-#                     rep_frame = extract_representative_frame(clip)
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": result["path"],
-#                         "character": result["character"],
-#                         "embedding": encode_image_from_pil(rep_frame),
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-#                     clip.close()
-#                 except Exception as e:
-#                     logging.error(f"Error processing video: {e}")
-
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-#             for character, img_list in (image_paths or {}).items():
-#                 for img_path in img_list:
-#                     try:
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                     except Exception as e:
-#                         logging.error(f"Image error: {img_path} -> {e}")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         segment_info_list = [
-#             (segment, media_pool, (segment_audio_paths[i] if segment_audio_paths else None),
-#              section_dir, chunk_folder, i, used_media_dict, media_lock, mode, avatar, background_video)
-#             for i, segment in enumerate(vid_segments or [])
-#         ]
-
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             chunk_paths = pool.map(encode_video_segment, segment_info_list)
-
-#         chunk_paths = [p for p in chunk_paths if p and os.path.exists(p)]
-#         if not chunk_paths:
-#             raise RuntimeError("All segment encodings failed.")
-
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-#         with open(concat_txt_path, "w", encoding="utf-8") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-#         # Re-encode once with safe audio smoothing & uniform format (pop-free)
-#         ffmpeg_cmd = [
-#             "ffmpeg",
-#             "-fflags", "+genpts",
-#             "-f", "concat", "-safe", "0",
-#             "-i", concat_txt_path,
-#             # Video
-#             "-c:v", ("h264_nvenc" if torch.cuda.is_available() else "libx264"),
-#             "-preset", "p5",
-#             "-tune", "hq",
-#             "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#             "-profile:v", "high",
-#             "-pix_fmt", "yuv420p",
-#             "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#             "-r", str(VIDEO_FPS),
-#             # Audio
-#             "-c:a", "aac", "-b:a", "192k",
-#             "-ar", str(AUDIO_SR),
-#             "-ac", "2",
-#             "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0,highpass=f=20,alimiter=limit=0.97",
-#             # Container
-#             "-movflags", "+faststart",
-#             "-y", output_path
-#         ]
-
-#         subprocess.run(ffmpeg_cmd, check=True)
-
-#         # 🔤 Optional subtitles before BGM
-#         # try:
-#         #     srt_path = generate_srt_from_video(output_path)
-#         #     burned_output_path = output_path.replace(".mp4", "_subtitled.mp4")
-#         #     burn_srt_to_video(output_path, srt_path, burned_output_path)
-#         #     output_path = burned_output_path
-#         # except Exception as e:
-#         #     logging.error(f"⚠️ Subtitle generation or burn failed: {e}")
-
-#         # 🎵 Add background music AFTER subtitles are burned
-#         if background:
-#             add_background_music(output_path, background)
-#         else:
-#             logging.warning("⚠️ No background music provided. Skipping background music addition.")
-
-#         # 🧹 Clean up temp files
-#         try:
-#             for f in ["output.srt", "temp_audio.mp3", concat_txt_path]:
-#                 if os.path.exists(f):
-#                     os.remove(f)
-#         except Exception as e:
-#             logging.warning(f"🧹 Cleanup warning: {e}")
-
-#         logging.info(f"✅ Final video created with background music: {output_path}")
-#         return output_path, (timestamp if mode in ["create", "commentary", "original"] else asset_folder), lambda: None
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-#         try:
-#             send_telegram_notification(
-#                 f'fWE HAVE FAILED error: {full_trace}',
-#                 "Failure",
-#                 "https://claude.ai/completed/",
-#                 "Failed Man"
-#             )
-#         except Exception:
-#             pass
-#         return None, None, None
-
-
-########important last b4 full_audio integration
-# def create_video(phase_media,full_audio,mode, avatar, background_video, background, user_id, section_type,
-#                  clip_data_list=None, image_data_list=None,
-#                  segment_audio_paths=None, narration_text=None, characters=None,
-#                  vid_segments=None, asset_folder=None, output_dir=OUTPUT):
-
-#     os.makedirs(output_dir, exist_ok=True)
-
-#     if mode in ["create", "commentary","original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#          # Check if asset_folder is split into two folders (intro and body)
-#         if "-" in asset_folder:
-#           intro_timestamp, body_timestamp = asset_folder.split("-")
-#           section_dir = os.path.join(TEMP_DIR, intro_timestamp if section_type == "intro" else body_timestamp)
-#         else:
-#             # Use the same folder for both intro and body
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-#     output_path = os.path.join(output_dir, f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
-#     if mode == "original":
-#            media_data=phase_media["phase_media"]
-#            vid_segments = assign_timeline_phases(vid_segments, segment_audio_paths,media_data,intro_sec=phase_media["intro_sec"], finale_sec=phase_media["finale_sec"])
-
-#     try:
-#         media_pool = []
-
-#         if mode in ["create", "commentary","original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             video_results = download_video_clips_in_parallel(clip_data_list, section_dir, user_id)
-#             for result in video_results:
-#                 try:
-#                     clip = VideoFileClip(result["path"])
-#                     rep_frame = extract_representative_frame(clip)
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": result["path"],
-#                         "character": result["character"],
-#                         "embedding": encode_image_from_pil(rep_frame),
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-#                     clip.close()
-#                 except Exception as e:
-#                     logging.error(f"Error processing video: {e}")
-
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-#             for character, img_list in image_paths.items():
-#                 for img_path in img_list:
-#                     try:
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                     except Exception as e:
-#                         logging.error(f"Image error: {img_path} -> {e}")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         segment_info_list = [
-#             (segment, media_pool, segment_audio_paths[i], section_dir, chunk_folder, i,
-#              used_media_dict, media_lock, mode, avatar, background_video)
-#             for i, segment in enumerate(vid_segments)
-#         ]
-
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             chunk_paths = pool.map(encode_video_segment, segment_info_list)
-
-#         chunk_paths = [p for p in chunk_paths if p and os.path.exists(p)]
-#         if not chunk_paths:
-#             raise RuntimeError("All segment encodings failed.")
-
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-#         with open(concat_txt_path, "w") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-#         ffmpeg_cmd = [
-#             "ffmpeg", "-f", "concat", "-safe", "0",
-#             "-i", concat_txt_path,
-#             "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#             "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#             "-profile:v", "high", "-pix_fmt", "yuv420p",
-#             "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#             "-c:a", "aac", "-b:a", "192k",
-#             "-movflags", "+faststart",
-#             "-y", output_path
-#         ]
-
-
-#         subprocess.run(ffmpeg_cmd, check=True)
-
-#         # 🔤 Subtitles (before background music)
-#         # try:
-#         #     srt_path = generate_srt_from_video(output_path)
-#         #     burned_output_path = output_path.replace(".mp4", "_subtitled.mp4")
-#         #     burn_srt_to_video(output_path, srt_path, burned_output_path)
-#         #     output_path = burned_output_path
-#         # except Exception as e:
-#         #     logging.error(f"⚠️ Subtitle generation or burn failed: {e}")
-
-#         # 🎵 Add background music AFTER subtitles are burned
-#         if background:
-#             add_background_music(output_path, background)
-#         else:
-#             logging.warning("⚠️ No background music provided. Skipping background music addition.")
-
-#         # 🧹 Clean up temp files
-#         try:
-#             for f in ["output.srt", "temp_audio.mp3", concat_txt_path]:
-#                 if os.path.exists(f):
-#                     os.remove(f)
-#         except Exception as e:
-#             logging.warning(f"🧹 Cleanup warning: {e}")
-
-#         logging.info(f"✅ Final video created with background music: {output_path}")
-#         return output_path, (timestamp if mode in ["create", "commentary","original"] else asset_folder), lambda: print("✅ Done!")
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-#         send_telegram_notification(
-#             f'fWE HAVE FAILED error: {full_trace}',
-#             "Failure",
-#             "https://claude.ai/completed/",
-#             "Failed Man"
-#         )
-#         return None, None, None
-
-# def create_video(phase_media,full_audio,mode, avatar, background_video, background, user_id, section_type,script=None,
-#                  clip_data_list=None, image_data_list=None,
-#                  segment_audio_paths=None, narration_text=None, characters=None,
-#                  vid_segments=None, asset_folder=None, output_dir=OUTPUT):
-
-#     os.makedirs(output_dir, exist_ok=True)
-#     script_context = None  # ✅ Define a default value here
-
-#     if mode in ["create", "commentary","original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#          # Check if asset_folder is split into two folders (intro and body)
-#         if "-" in asset_folder:
-#           intro_timestamp, body_timestamp = asset_folder.split("-")
-#           section_dir = os.path.join(TEMP_DIR, intro_timestamp if section_type == "intro" else body_timestamp)
-#         else:
-#             # Use the same folder for both intro and body
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-#     output_path = os.path.join(output_dir, f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
-#     if mode == "original":
-#            media_data=phase_media["phase_media"]
-#         #    script_context=generate_script_context(script)
-#            script_context=None
-#            vid_segments = assign_timeline_phases(vid_segments, segment_audio_paths,media_data,intro_sec=phase_media["intro_sec"], finale_sec=phase_media["finale_sec"])
-
-#     try:
-#         media_pool = []
-
-#         if mode in ["create", "commentary","original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             video_results = download_video_clips_in_parallel(clip_data_list, section_dir, user_id)
-#             for result in video_results:
-#                 try:
-#                     clip = VideoFileClip(result["path"])
-#                     rep_frame = extract_representative_frame(clip)
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": result["path"],
-#                         "character": result["character"],
-#                         "embedding": encode_image_from_pil(rep_frame),
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-#                     clip.close()
-#                 except Exception as e:
-#                     logging.error(f"Error processing video: {e}")
-
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-#             for character, img_list in image_paths.items():
-#                 for img_path in img_list:
-#                     try:
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                     except Exception as e:
-#                         logging.error(f"Image error: {img_path} -> {e}")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         segment_info_list = [
-#             (segment, media_pool, segment_audio_paths[i], section_dir, chunk_folder, i,
-#              used_media_dict, media_lock, mode, avatar, background_video,vid_segments,script_context)
-#             for i, segment in enumerate(vid_segments)
-#         ]
-
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             # chunk_paths = pool.map(encode_video_segment, segment_info_list)
-#             chunk_paths = pool.map(encode_video_segment_with_retry, segment_info_list)
-
-
-#         chunk_paths = [p for p in chunk_paths if p and os.path.exists(p)]
-#         if not chunk_paths:
-#             raise RuntimeError("All segment encodings failed.")
-
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-#         with open(concat_txt_path, "w") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-#         # Check if mode is original and handle audio accordingly
-#         if mode == "original" and full_audio:
-#             logging.info("🎵 Original mode detected - muting segments and overlaying full audio...")
-            
-#             # Step 1: Concatenate video segments without audio
-#             temp_video_no_audio = os.path.join(chunk_folder, "temp_video_no_audio.mp4")
-#             ffmpeg_cmd = [
-#                 "ffmpeg", "-f", "concat", "-safe", "0",
-#                 "-i", concat_txt_path,
-#                 "-c:v", "copy",  # Copy video (fast, no re-encode)
-#                 "-an",  # Remove all audio
-#                 "-movflags", "+faststart",
-#                 "-y", temp_video_no_audio
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-            
-#             # Step 2: Overlay the full audio track
-#             ffmpeg_cmd = [
-#                 "ffmpeg",
-#                 "-i", temp_video_no_audio,
-#                 "-i", full_audio,
-#                 "-c:v", "copy",  # Copy video (no re-encode)
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-map", "0:v:0",  # Take video from first input
-#                 "-map", "1:a:0",  # Take audio from second input
-#                 "-shortest",  # Match shortest stream
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-            
-#             # Cleanup temp file
-#             os.remove(temp_video_no_audio)
-#             logging.info("✅ Successfully overlayed full audio track")
-            
-#         else:
-#             # Normal mode - concatenate with audio re-encoding
-#             ffmpeg_cmd = [
-#                 "ffmpeg", "-f", "concat", "-safe", "0",
-#                 "-i", concat_txt_path,
-#                 "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#                 "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M",
-#                 "-profile:v", "high", "-pix_fmt", "yuv420p",
-#                 "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-
-#         # 🔤 Subtitles (before background music)
-#         # try:
-#         #     srt_path = generate_srt_from_video(output_path)
-#         #     burned_output_path = output_path.replace(".mp4", "_subtitled.mp4")
-#         #     burn_srt_to_video(output_path, srt_path, burned_output_path)
-#         #     output_path = burned_output_path
-#         # except Exception as e:
-#         #     logging.error(f"⚠️ Subtitle generation or burn failed: {e}")
-
-#         # 🎵 Add background music AFTER subtitles are burned
-#         if background:
-#             add_background_music(output_path, background)
-#         else:
-#             logging.warning("⚠️ No background music provided. Skipping background music addition.")
-
-#         # 🧹 Clean up temp files
-#         try:
-#             for f in ["output.srt", "temp_audio.mp3", concat_txt_path]:
-#                 if os.path.exists(f):
-#                     os.remove(f)
-#         except Exception as e:
-#             logging.warning(f"🧹 Cleanup warning: {e}")
-
-#         logging.info(f"✅ Final video created with background music: {output_path}")
-#         return output_path, (timestamp if mode in ["create", "commentary","original"] else asset_folder), lambda: print("✅ Done!")
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-#         send_telegram_notification(
-#             f'fWE HAVE FAILED error: {full_trace}',
-#             "Failure",
-#             "https://claude.ai/completed/",
-#             "Failed Man"
-#         )
-#         return None, None, None
 from helper.transition_engine import apply_transitions_and_concat
-
-
-
-
-# def create_video(
-#     phase_media,
-#     full_audio,
-#     mode,
-#     avatar,
-#     background_video,
-#     background,
-#     user_id,
-#     section_type,
-#     orientation,     # NEW
-#     storyboard,      # NEW
-#     kenburns,        # NEW
-#     srt,
-#     avatar_active,
-#     caption_settings,
-#     captions_enabled,
-#     script=None,
-#     clip_data_list=None,
-#     image_data_list=None,
-#     segment_audio_paths=None,
-#     narration_text=None,
-#     characters=None,
-#     vid_segments=None,
-#     asset_folder=None,
-#     output_dir=OUTPUT,
-# ):
-#     # -----------------------------------------
-#     # GLOBAL ORIENTATION + STORYBOARD + KENBURNS (MAIN PROCESS)
-#     # -----------------------------------------
-#     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
-#     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
-
-#     print("NEW VALUES", orientation, storyboard, kenburns)
-
-#     # Main-process global updates (workers do NOT inherit this)
-#     CURRENT_ORIENTATION = orientation.lower().strip()
-#     if CURRENT_ORIENTATION == "portrait":
-#         CURRENT_WIDTH = 1080
-#         CURRENT_HEIGHT = 1920
-#     else:
-#         CURRENT_WIDTH = 1920
-#         CURRENT_HEIGHT = 1080
-
-#     CURRENT_STORYBOARD_ENABLED = bool(storyboard)
-#     CURRENT_KENBURNS_ENABLED = bool(kenburns)
-
-#     # -----------------------------------------
-#     # DIRECTORY SETUP
-#     # -----------------------------------------
-#     os.makedirs(output_dir, exist_ok=True)
-#     script_context = None
-
-#     if mode in ["create", "commentary", "original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#         if "-" in asset_folder:
-#             intro_timestamp, body_timestamp = asset_folder.split("-")
-#             section_dir = os.path.join(
-#                 TEMP_DIR,
-#                 intro_timestamp if section_type == "intro" else body_timestamp
-#             )
-#         else:
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-
-#     output_path = os.path.join(
-#         output_dir,
-#         f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-#     )
-
-#     # -----------------------------------------
-#     # ORIGINAL MODE SETUP
-#     # -----------------------------------------
-#     if mode == "original":
-#         media_data = phase_media["phase_media"]
-#         script_context = None
-
-#         vid_segments = assign_timeline_phases(
-#             vid_segments,
-#             segment_audio_paths,
-#             media_data,
-#             intro_sec=phase_media["intro_sec"],
-#             finale_sec=phase_media["finale_sec"],
-#         )
-
-#     try:
-#         media_pool = []
-
-#         # -------------------------------------------------
-#         # PREPARE MEDIA POOL
-#         # -------------------------------------------------
-#         if mode in ["create", "commentary", "original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             # VIDEO CLIPS - DOWNLOAD
-#             video_results = download_video_clips_in_parallel(
-#                 clip_data_list, section_dir, user_id
-#             )
-            
-#             logging.info(f"✅ Completed {len(video_results)} video clips successfully.")
-            
-#             # 🔥 CRITICAL FIX: Give FFmpeg time to release file handles
-#             logging.info("⏳ Waiting for FFmpeg cleanup (2 seconds)...")
-#             time.sleep(2)
-            
-#             logging.info("🔍 CHECKPOINT 1: Starting video processing...")
-
-#             # VIDEO CLIPS - PROCESS
-#             for idx, result in enumerate(video_results):
-#                 try:
-#                     video_path = result["path"]
-#                     logging.info(f"📹 Processing video {idx+1}/{len(video_results)}: {os.path.basename(video_path)}")
-                    
-#                     clip = VideoFileClip(video_path)
-#                     logging.debug(f"   Opened clip: {clip.duration:.2f}s")
-                    
-#                     rep_frame = extract_representative_frame(clip)
-#                     logging.debug(f"   Extracted representative frame")
-                    
-#                     embedding = encode_image_from_pil(rep_frame)
-#                     logging.debug(f"   Encoded frame embedding")
-
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": video_path,
-#                         "character": result["character"],
-#                         "embedding": embedding,
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-                    
-#                     # Close immediately and cleanup
-#                     clip.close()
-#                     if hasattr(clip, 'reader') and clip.reader:
-#                         clip.reader.close()
-#                     del clip
-                    
-#                     logging.info(f"✅ Processed video {idx+1}/{len(video_results)}")
-                    
-#                 except Exception as e:
-#                     logging.error(f"❌ Error processing video {idx+1}: {e}")
-                    
-#                     logging.error(traceback.format_exc())
-            
-#             logging.info(f"✅ All {len(video_results)} videos processed successfully")
-
-#             # IMAGES
-#             logging.info("🖼️  Processing images...")
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-            
-#             image_count = 0
-#             for character, img_list in image_paths.items():
-#                 for img_path in img_list:
-#                     try:
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                         image_count += 1
-#                     except Exception as e:
-#                         logging.error(f"❌ Image error: {img_path} -> {e}")
-            
-#             logging.info(f"✅ Processed {image_count} images")
-#             logging.info(f"📊 Total media pool: {len(media_pool)} items")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         # -------------------------------------------------
-#         # SEGMENT ENCODING (MULTIPROCESSING)
-#         # -------------------------------------------------
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         # 🔥 Pass orientation, storyboard, kenburns to workers
-#         segment_info_list = [
-#             (
-#                 segment,
-#                 media_pool,
-#                 segment_audio_paths[i],
-#                 section_dir,
-#                 chunk_folder,
-#                 i,
-#                 used_media_dict,
-#                 media_lock,
-#                 mode,
-#                 avatar,
-#                 background_video,
-#                 vid_segments,
-#                 script_context,
-#                 orientation,
-#                 storyboard,
-#                 kenburns,
-#                 avatar_active
-#             )
-#             for i, segment in enumerate(vid_segments)
-#         ]
-
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             chunk_paths = pool.map(encode_video_segment_with_retry, segment_info_list)
-
-#         chunk_paths = [p for p in chunk_paths if p and os.path.exists(p)]
-#         if not chunk_paths:
-#             raise RuntimeError("All segment encodings failed.")
-
-#         logging.info(f"✅ Encoded {len(chunk_paths)} segments")
-
-#         # -------------------------------------------------
-#         # FINAL CONCAT
-#         # -------------------------------------------------
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-
-#         with open(concat_txt_path, "w") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-#         if mode == "original" and full_audio:
-#             logging.info("🎵 Original mode — overlaying full audio.")
-
-#             temp_video_no_audio = os.path.join(chunk_folder, "temp_video_no_audio.mp4")
-
-#             ffmpeg_cmd = [
-#                 "ffmpeg", "-f", "concat", "-safe", "0",
-#                 "-i", concat_txt_path,
-#                 "-c:v", "copy", "-an",
-#                 "-movflags", "+faststart", "-y", temp_video_no_audio
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-
-#             ffmpeg_cmd = [
-#                 "ffmpeg",
-#                 "-i", temp_video_no_audio,
-#                 "-i", full_audio,
-#                 "-c:v", "copy",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-map", "0:v:0",
-#                 "-map", "1:a:0",
-#                 "-shortest",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-#             os.remove(temp_video_no_audio)
-
-#         else:
-            # ffmpeg_cmd = [
-            #     "ffmpeg", "-f", "concat", "-safe", "0",
-            #     "-i", concat_txt_path,
-            #     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-            #     "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M",
-            #     "-bufsize", "24M",
-            #     "-profile:v", "high", "-pix_fmt", "yuv420p",
-            #     "-colorspace", "bt709", "-color_primaries", "bt709",
-            #     "-color_trc", "bt709",
-            #     "-c:a", "aac", "-b:a", "192k",
-            #     "-movflags", "+faststart",
-            #     "-y", output_path
-            # ]
-            # subprocess.run(ffmpeg_cmd, check=True)
-
-#         # -------------------------------------------------
-#         # BACKGROUND MUSIC
-#         # -------------------------------------------------
-#         if background:
-#             logging.info("🎵 Adding background music...")
-#             add_background_music(output_path, background)
-#         else:
-#             logging.info("ℹ️  No background music specified")
-
-#         # -------------------------------------------------
-#         # CAPTIONS/SUBTITLES
-#         # -------------------------------------------------
-#         if captions_enabled and srt and os.path.exists(srt):
-#             logging.info("📝 Burning subtitles into final video...")
-            
-#             subbed_output_path = output_path.replace(".mp4", "_subbed.mp4")
-            
-#             success = burn_srt_to_video(
-#                 input_video=output_path,
-#                 srt_file=srt,
-#                 output_video=subbed_output_path,
-#                 caption_settings=caption_settings
-#             )
-            
-#             if success:
-#                 try:
-#                     os.remove(output_path)
-#                     os.rename(subbed_output_path, output_path)
-#                     logging.info(f"✅ Subtitles burned successfully → {output_path}")
-#                 except Exception as e:
-#                     logging.error(f"❌ Failed to replace original video: {e}")
-#                     if os.path.exists(subbed_output_path):
-#                         output_path = subbed_output_path
-#             else:
-#                 logging.warning("⚠️  Subtitle burning failed, continuing without subtitles")
-#         else:
-#             if captions_enabled:
-#                 logging.warning("⚠️  Captions enabled but no SRT file provided")
-
-#         # -------------------------------------------------
-#         # CLEANUP
-#         # -------------------------------------------------
-#         cleanup_files = ["output.srt", "temp_audio.mp3", concat_txt_path]
-#         for f in cleanup_files:
-#             if os.path.exists(f):
-#                 try:
-#                     os.remove(f)
-#                     logging.debug(f"🧹 Cleaned up: {f}")
-#                 except Exception as e:
-#                     logging.warning(f"⚠️  Could not remove {f}: {e}")
-
-#         logging.info(f"✅ Final video created: {output_path}")
-
-#         return (
-#             output_path,
-#             (timestamp if mode in ["create", "commentary", "original"] else asset_folder),
-#             lambda: print("✅ Done!")
-#         )
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-
-#         send_telegram_notification(
-#             f"WE HAVE FAILED error: {full_trace}",
-#             "Failure",
-#             "https://claude.ai/completed/",
-#             "Failed Man",
-#         )
-#         return None, None, None
-
-# def create_video(
-#     phase_media,
-#     full_audio,
-#     mode,
-#     avatar,
-#     background_video,
-#     background,
-#     user_id,
-#     section_type,
-#     orientation,
-#     storyboard,
-#     kenburns,
-#     srt,
-#     avatar_active,
-#     caption_settings,
-#     captions_enabled,
-#     script=None,
-#     clip_data_list=None,
-#     image_data_list=None,
-#     segment_audio_paths=None,
-#     narration_text=None,
-#     characters=None,
-#     vid_segments=None,
-#     asset_folder=None,
-#     output_dir=OUTPUT,
-#     transition_config=None,  # NEW PARAMETER
-# ):
-#     """
-#     Main video creation function with support for smooth transitions between segments.
-    
-#     New Args:
-#         transition_config: Optional dict to configure transitions between segments
-#             {
-#                 "enabled": bool (default: True),
-#                 "duration": float (default: 0.5),
-#                 "types": list (default: ["fade", "dissolve", "circleopen"]),
-#                 "mode": str "cycle" or "random" (default: "cycle")
-#             }
-#     """
-#     # -----------------------------------------
-#     # GLOBAL ORIENTATION + STORYBOARD + KENBURNS (MAIN PROCESS)
-#     # -----------------------------------------
-#     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
-#     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
-
-#     print("NEW VALUES", orientation, storyboard, kenburns)
-
-#     # Main-process global updates (workers do NOT inherit this)
-#     CURRENT_ORIENTATION = orientation.lower().strip()
-#     if CURRENT_ORIENTATION == "portrait":
-#         CURRENT_WIDTH = 1080
-#         CURRENT_HEIGHT = 1920
-#     else:
-#         CURRENT_WIDTH = 1920
-#         CURRENT_HEIGHT = 1080
-
-#     CURRENT_STORYBOARD_ENABLED = bool(storyboard)
-#     CURRENT_KENBURNS_ENABLED = bool(kenburns)
-
-#     # -----------------------------------------
-#     # DIRECTORY SETUP
-#     # -----------------------------------------
-#     os.makedirs(output_dir, exist_ok=True)
-#     script_context = None
-
-#     if mode in ["create", "commentary", "original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#         if "-" in asset_folder:
-#             intro_timestamp, body_timestamp = asset_folder.split("-")
-#             section_dir = os.path.join(
-#                 TEMP_DIR,
-#                 intro_timestamp if section_type == "intro" else body_timestamp
-#             )
-#         else:
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-
-#     output_path = os.path.join(
-#         output_dir,
-#         f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-#     )
-
-#     # -----------------------------------------
-#     # ORIGINAL MODE SETUP
-#     # -----------------------------------------
-#     if mode == "original":
-#         media_data = phase_media["phase_media"]
-#         script_context = None
-
-#         vid_segments = assign_timeline_phases(
-#             vid_segments,
-#             segment_audio_paths,
-#             media_data,
-#             intro_sec=phase_media["intro_sec"],
-#             finale_sec=phase_media["finale_sec"],
-#         )
-
-#     try:
-#         media_pool = []
-
-#         # -------------------------------------------------
-#         # PREPARE MEDIA POOL
-#         # -------------------------------------------------
-#         if mode in ["create", "commentary", "original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             # VIDEO CLIPS - DOWNLOAD
-#             video_results = download_video_clips_in_parallel(
-#                 clip_data_list, section_dir, user_id
-#             )
-            
-#             logging.info(f"✅ Completed {len(video_results)} video clips successfully.")
-            
-#             # 🔥 CRITICAL FIX: Give FFmpeg time to release file handles
-#             logging.info("⏳ Waiting for FFmpeg cleanup (2 seconds)...")
-#             time.sleep(2)
-            
-#             logging.info("🔍 CHECKPOINT 1: Starting video processing...")
-
-#             # VIDEO CLIPS - PROCESS
-#             for idx, result in enumerate(video_results):
-#                 try:
-#                     video_path = result["path"]
-#                     logging.info(f"📹 Processing video {idx+1}/{len(video_results)}: {os.path.basename(video_path)}")
-                    
-#                     clip = VideoFileClip(video_path)
-#                     logging.debug(f"   Opened clip: {clip.duration:.2f}s")
-                    
-#                     rep_frame = extract_representative_frame(clip)
-#                     logging.debug(f"   Extracted representative frame")
-                    
-#                     embedding = encode_image_from_pil(rep_frame)
-#                     logging.debug(f"   Encoded frame embedding")
-
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": video_path,
-#                         "character": result["character"],
-#                         "embedding": embedding,
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-                    
-#                     # Close immediately and cleanup
-#                     clip.close()
-#                     if hasattr(clip, 'reader') and clip.reader:
-#                         clip.reader.close()
-#                     del clip
-                    
-#                     logging.info(f"✅ Processed video {idx+1}/{len(video_results)}")
-                    
-#                 except Exception as e:
-#                     logging.error(f"❌ Error processing video {idx+1}: {e}")
-#                     logging.error(traceback.format_exc())
-            
-#             logging.info(f"✅ All {len(video_results)} videos processed successfully")
-
-#             # IMAGES
-#             logging.info("🖼️  Processing images...")
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-            
-#             image_count = 0
-#             for character, img_list in image_paths.items():
-#                 for img_path in img_list:
-#                     try:
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                         image_count += 1
-#                     except Exception as e:
-#                         logging.error(f"❌ Image error: {img_path} -> {e}")
-            
-#             logging.info(f"✅ Processed {image_count} images")
-#             logging.info(f"📊 Total media pool: {len(media_pool)} items")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         # -------------------------------------------------
-#         # SEGMENT ENCODING (MULTIPROCESSING)
-#         # -------------------------------------------------
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         # 🔥 Pass orientation, storyboard, kenburns to workers
-#         segment_info_list = [
-#             (
-#                 segment,
-#                 media_pool,
-#                 segment_audio_paths[i],
-#                 section_dir,
-#                 chunk_folder,
-#                 i,
-#                 used_media_dict,
-#                 media_lock,
-#                 mode,
-#                 avatar,
-#                 background_video,
-#                 vid_segments,
-#                 script_context,
-#                 orientation,
-#                 storyboard,
-#                 kenburns,
-#                 avatar_active
-#             )
-#             for i, segment in enumerate(vid_segments)
-#         ]
-
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             chunk_paths = pool.map(encode_video_segment_with_retry, segment_info_list)
-
-#         chunk_paths = [p for p in chunk_paths if p and os.path.exists(p)]
-#         if not chunk_paths:
-#             raise RuntimeError("All segment encodings failed.")
-
-#         logging.info(f"✅ Encoded {len(chunk_paths)} segments")
-        
-#         # -------------------------------------------------
-#         # FINAL CONCAT
-#         # -------------------------------------------------
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-
-#         with open(concat_txt_path, "w") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-        
-#         if mode == "original" and full_audio:
-#             # -------------------------------------------------
-#         # FINAL CONCAT WITH TRANSITIONS
-#         # -------------------------------------------------
-#             logging.info("📦 Final assembly with transitions...")
-        
-#             # Configure transitions (use provided config or defaults)
-#             if transition_config is None:
-#                 transition_config = {
-#                 "enabled": True,  # Set to False to disable transitions
-#                 "duration": 0.5,  # Half-second transitions
-#                "types": [ "slideleft","slideright","slideup"],  # Professional set
-#                 "mode": "cycle"  # Alternate between types
-#             }
-#                 whoosh_config = {
-#         "enabled": True,
-#         "volume": 0.6,
-#         "transitions": ["slideleft", "slideright", "slideup","wipeleft", "wiperight", "wipeup"],
-#         "mp3_path": "sounds/whoosh.mp3"
-#     }
-        
-#             logging.info("🎵 Original mode — applying transitions then overlaying audio.")
-            
-#             temp_video_no_audio = os.path.join(chunk_folder, "temp_video_no_audio.mp4")
-            
-#             # Apply transitions (video only, no audio yet)
-#             apply_transitions_and_concat(
-#                 chunk_paths, 
-#                 temp_video_no_audio,
-#                 transition_config,
-#                 whoosh_config,
-#             )
-            
-#             # Overlay full audio track
-#             ffmpeg_cmd = [
-#                 "ffmpeg",
-#                 "-i", temp_video_no_audio,
-#                 "-i", full_audio,
-#                 "-c:v", "copy",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-map", "0:v:0",
-#                 "-map", "1:a:0",
-#                 "-shortest",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-            
-#             # Cleanup temp file
-#             os.remove(temp_video_no_audio)
-            
-#         else:
-#             # Normal mode: apply transitions with segment audio
-#             ffmpeg_cmd = [
-#                 "ffmpeg", "-f", "concat", "-safe", "0",
-#                 "-i", concat_txt_path,
-#                 "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#                 "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M",
-#                 "-bufsize", "24M",
-#                 "-profile:v", "high", "-pix_fmt", "yuv420p",
-#                 "-colorspace", "bt709", "-color_primaries", "bt709",
-#                 "-color_trc", "bt709",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-#             subprocess.run(ffmpeg_cmd, check=True)
-
-#         # -------------------------------------------------
-#         # BACKGROUND MUSIC
-#         # -------------------------------------------------
-#         if background:
-#             logging.info("🎵 Adding background music...")
-#             add_background_music(output_path, background)
-#         else:
-#             logging.info("ℹ️  No background music specified")
-
-#         # -------------------------------------------------
-#         # CAPTIONS/SUBTITLES
-#         # -------------------------------------------------
-#         if captions_enabled and srt and os.path.exists(srt):
-#             logging.info("📝 Burning subtitles into final video...")
-            
-#             subbed_output_path = output_path.replace(".mp4", "_subbed.mp4")
-            
-#             success = burn_srt_to_video(
-#                 input_video=output_path,
-#                 srt_file=srt,
-#                 output_video=subbed_output_path,
-#                 caption_settings=caption_settings
-#             )
-            
-#             if success:
-#                 try:
-#                     os.remove(output_path)
-#                     os.rename(subbed_output_path, output_path)
-#                     logging.info(f"✅ Subtitles burned successfully → {output_path}")
-#                 except Exception as e:
-#                     logging.error(f"❌ Failed to replace original video: {e}")
-#                     if os.path.exists(subbed_output_path):
-#                         output_path = subbed_output_path
-#             else:
-#                 logging.warning("⚠️  Subtitle burning failed, continuing without subtitles")
-#         else:
-#             if captions_enabled:
-#                 logging.warning("⚠️  Captions enabled but no SRT file provided")
-
-#         # -------------------------------------------------
-#         # CLEANUP
-#         # -------------------------------------------------
-#         cleanup_files = ["output.srt", "temp_audio.mp3"]
-#         for f in cleanup_files:
-#             if os.path.exists(f):
-#                 try:
-#                     os.remove(f)
-#                     logging.debug(f"🧹 Cleaned up: {f}")
-#                 except Exception as e:
-#                     logging.warning(f"⚠️  Could not remove {f}: {e}")
-
-#         logging.info(f"✅ Final video created: {output_path}")
-
-#         return (
-#             output_path,
-#             (timestamp if mode in ["create", "commentary", "original"] else asset_folder),
-#             lambda: print("✅ Done!")
-#         )
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-
-#         send_telegram_notification(
-#             f"WE HAVE FAILED error: {full_trace}",
-#             "Failure",
-#             "https://claude.ai/completed/",
-#             "Failed Man",
-#         )
-#         return None, None, None
-    
-
-# def create_video(
-#     phase_media,
-#     full_audio,
-#     mode,
-#     avatar,
-#     background_video,
-#     background,
-#     user_id,
-#     section_type,
-#     orientation,
-#     storyboard,
-#     kenburns,
-#     srt,
-#     avatar_active,
-#     caption_settings,
-#     captions_enabled,
-#     script=None,
-#     clip_data_list=None,
-#     image_data_list=None,
-#     segment_audio_paths=None,
-#     narration_text=None,
-#     characters=None,
-#     vid_segments=None,
-#     asset_folder=None,
-#     output_dir=OUTPUT,
-#     transition_config=None,
-# ):
-#     """
-#     Main video creation function with support for smooth transitions between segments.
-#     Includes comprehensive validation and failsafe mechanisms.
-    
-#     New Args:
-#         transition_config: Optional dict to configure transitions between segments
-#             {
-#                 "enabled": bool (default: True),
-#                 "duration": float (default: 0.5),
-#                 "types": list (default: ["fade", "dissolve", "circleopen"]),
-#                 "mode": str "cycle" or "random" (default: "cycle")
-#             }
-#     """
-#     # -----------------------------------------
-#     # GLOBAL ORIENTATION + STORYBOARD + KENBURNS (MAIN PROCESS)
-#     # -----------------------------------------
-#     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
-#     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
-
-#     print("NEW VALUES", orientation, storyboard, kenburns)
-
-#     # Main-process global updates (workers do NOT inherit this)
-#     CURRENT_ORIENTATION = orientation.lower().strip()
-#     if CURRENT_ORIENTATION == "portrait":
-#         CURRENT_WIDTH = 1080
-#         CURRENT_HEIGHT = 1920
-#     else:
-#         CURRENT_WIDTH = 1920
-#         CURRENT_HEIGHT = 1080
-
-#     CURRENT_STORYBOARD_ENABLED = bool(storyboard)
-#     CURRENT_KENBURNS_ENABLED = bool(kenburns)
-
-#     # Store for later use
-#     canvas_w = CURRENT_WIDTH
-#     canvas_h = CURRENT_HEIGHT
-
-#     mp_manager = Manager()
-#     gpu_semaphore = mp_manager.Semaphore(1)
-
-
-#     # -----------------------------------------
-#     # DIRECTORY SETUP
-#     # -----------------------------------------
-#     os.makedirs(output_dir, exist_ok=True)
-#     script_context = None
-
-#     if mode in ["create", "commentary", "original"]:
-#         timestamp = time.strftime("%Y%m%d_%H%M%S")
-#         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
-#         os.makedirs(section_dir, exist_ok=True)
-#     else:
-#         if "-" in asset_folder:
-#             intro_timestamp, body_timestamp = asset_folder.split("-")
-#             section_dir = os.path.join(
-#                 TEMP_DIR,
-#                 intro_timestamp if section_type == "intro" else body_timestamp
-#             )
-#         else:
-#             section_dir = os.path.join(TEMP_DIR, asset_folder)
-
-#     output_path = os.path.join(
-#         output_dir,
-#         f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-#     )
-
-#     # -----------------------------------------
-#     # ORIGINAL MODE SETUP
-#     # -----------------------------------------
-#     if mode == "original":
-#         media_data = phase_media["phase_media"]
-#         script_context = None
-
-#         vid_segments = assign_timeline_phases(
-#             vid_segments,
-#             segment_audio_paths,
-#             media_data,
-#             intro_sec=phase_media["intro_sec"],
-#             finale_sec=phase_media["finale_sec"],
-#         )
-
-#     try:
-#         media_pool = []
-
-#         # -------------------------------------------------
-#         # PREPARE MEDIA POOL
-#         # -------------------------------------------------
-#         if mode in ["create", "commentary", "original"]:
-#             logging.info(f"📦 Preparing media for {section_type}...")
-
-#             # VIDEO CLIPS - DOWNLOAD
-#             video_results = download_video_clips_in_parallel(
-#                 clip_data_list, section_dir, user_id
-#             )
-            
-#             logging.info(f"✅ Completed {len(video_results)} video clips successfully.")
-            
-#             # 🔥 CRITICAL FIX: Give FFmpeg time to release file handles
-#             logging.info("⏳ Waiting for FFmpeg cleanup (5 seconds)...")
-#             time.sleep(5)
-            
-#             logging.info("🔍 CHECKPOINT 1: Starting video processing...")
-
-#             # VIDEO CLIPS - PROCESS
-#             for idx, result in enumerate(video_results):
-#                 try:
-#                     video_path = result["path"]
-#                     logging.info(f"📹 Processing video {idx+1}/{len(video_results)}: {os.path.basename(video_path)}")
-                    
-#                     # 🔥 NEW: Validate video before processing
-#                     if not os.path.exists(video_path):
-#                         logging.error(f"❌ Video file missing: {video_path}")
-#                         continue
-                    
-#                     file_size = os.path.getsize(video_path)
-#                     if file_size < 10000:
-#                         logging.error(f"❌ Video file too small: {file_size} bytes")
-#                         continue
-                    
-#                     # Quick validation
-#                     if not validate_video_file(video_path, max_retries=1):
-#                         logging.error(f"❌ Video validation failed: {video_path}")
-#                         continue
-                    
-#                     clip = VideoFileClip(video_path)
-#                     logging.debug(f"   Opened clip: {clip.duration:.2f}s")
-                    
-#                     rep_frame = extract_representative_frame(clip)
-#                     logging.debug(f"   Extracted representative frame")
-                    
-#                     embedding = encode_image_from_pil(rep_frame)
-#                     logging.debug(f"   Encoded frame embedding")
-
-#                     media_pool.append({
-#                         "type": "video",
-#                         "path": video_path,
-#                         "character": result["character"],
-#                         "embedding": embedding,
-#                         "mute": result["mute"],
-#                         "duration": clip.duration,
-#                         "tag": result.get("tag")
-#                     })
-                    
-#                     # Close immediately and cleanup
-#                     clip.close()
-#                     if hasattr(clip, 'reader') and clip.reader:
-#                         clip.reader.close()
-#                     del clip
-                    
-#                     logging.info(f"✅ Processed video {idx+1}/{len(video_results)}")
-                    
-#                 except Exception as e:
-#                     logging.error(f"❌ Error processing video {idx+1}: {e}")
-#                     logging.error(traceback.format_exc())
-            
-#             logging.info(f"✅ All {len(video_results)} videos processed successfully")
-
-#             # IMAGES
-#             logging.info("🖼️  Processing images...")
-#             image_paths = download_images_in_parallel(image_data_list, section_dir)
-            
-#             image_count = 0
-#             for character, img_list in image_paths.items():
-#                 for img_path in img_list:
-#                     try:
-#                         # 🔥 NEW: Validate image before processing
-#                         if not validate_image_file(img_path):
-#                             logging.error(f"❌ Image validation failed: {img_path}")
-#                             continue
-                        
-#                         img = Image.open(img_path).convert("RGB")
-#                         media_pool.append({
-#                             "type": "image",
-#                             "path": img_path,
-#                             "character": character,
-#                             "embedding": encode_image_from_pil(img),
-#                             "duration": DEFAULT_DURATION,
-#                             "used": False
-#                         })
-#                         image_count += 1
-#                     except Exception as e:
-#                         logging.error(f"❌ Image error: {img_path} -> {e}")
-            
-#             logging.info(f"✅ Processed {image_count} images")
-#             logging.info(f"📊 Total media pool: {len(media_pool)} items")
-            
-#             # 🔥 NEW: Validate media pool integrity
-#             corrupt_count = 0
-#             for media in media_pool:
-#                 if media["type"] == "video":
-#                     if not os.path.exists(media["path"]) or os.path.getsize(media["path"]) < 10000:
-#                         corrupt_count += 1
-#                         logging.warning(f"⚠️ Corrupt video in pool: {media['path']}")
-#                 elif media["type"] == "image":
-#                     if not os.path.exists(media["path"]) or os.path.getsize(media["path"]) < 1000:
-#                         corrupt_count += 1
-#                         logging.warning(f"⚠️ Corrupt image in pool: {media['path']}")
-            
-#             if corrupt_count > 0:
-#                 logging.warning(f"⚠️ Found {corrupt_count} potentially corrupt media files in pool")
-#             else:
-#                 logging.info("✅ All media pool files passed basic integrity check")
-
-#             save_metadata(media_pool, section_dir)
-
-#         else:
-#             logging.info(f"♻️ Regenerating media for {section_type}...")
-#             media_pool = load_metadata(section_dir)
-
-#         # -------------------------------------------------
-#         # SEGMENT ENCODING (MULTIPROCESSING)
-#         # -------------------------------------------------
-#         logging.info("🧱 Encoding segments in parallel...")
-#         chunk_folder = os.path.join(section_dir, "chunks")
-#         os.makedirs(chunk_folder, exist_ok=True)
-
-#         manager = Manager()
-#         used_media_dict = manager.dict()
-#         media_lock = manager.Lock()
-
-#         from gpu_kenburns_simple import precompute_segment_effects
-#         effect_assignments, _video_seed = precompute_segment_effects(
-#     vid_segments=vid_segments,
-# )
-
-#         # 🔥 Pass orientation, storyboard, kenburns to workers
-#         segment_info_list = [
-#             (
-#                 segment,
-#                 media_pool,
-#                 segment_audio_paths[i],
-#                 section_dir,
-#                 chunk_folder,
-#                 i,
-#                 used_media_dict,
-#                 media_lock,
-#                 mode,
-#                 avatar,
-#                 background_video,
-#                 vid_segments,
-#                 script_context,
-#                 orientation,
-#                 storyboard,
-#                 kenburns,
-#                 avatar_active,
-#                 gpu_semaphore,
-#                 effect_assignments[i]
-#             )
-#             for i, segment in enumerate(vid_segments)
-#         ]
-
-#         # 🔥 Use retry wrapper
-#         with Pool(processes=min(5, cpu_count())) as pool:
-#             chunk_paths = pool.map(encode_video_segment_with_retry, segment_info_list)
-
-#         # -------------------------------------------------
-#         # 🔥 CRITICAL: VALIDATE ALL SEGMENTS ARE PRESENT
-#         # -------------------------------------------------
-#         logging.info("🔍 Validating segment completeness...")
-        
-#         validated_chunks = []
-#         missing_segments = []
-#         fallback_segments = []
-        
-#         for i, path in enumerate(chunk_paths):
-#             if path and os.path.exists(path) and os.path.getsize(path) > 10000:
-#                 validated_chunks.append(path)
-                
-#                 # Check if it's a fallback
-#                 if "fallback" in os.path.basename(path) or "emergency" in os.path.basename(path):
-#                     fallback_segments.append(i)
-#                     logging.warning(f"⚠️ Segment {i} is a FALLBACK placeholder")
-#                 else:
-#                     logging.debug(f"✅ Segment {i} validated: {os.path.basename(path)}")
-#             else:
-#                 missing_segments.append(i)
-#                 logging.error(f"❌ Segment {i} is MISSING or invalid")
-        
-#         # Report status
-#         total_segments = len(vid_segments)
-#         successful_segments = len(validated_chunks) - len(fallback_segments)
-        
-#         logging.info(f"")
-#         logging.info(f"{'='*60}")
-#         logging.info(f"📊 SEGMENT ENCODING SUMMARY")
-#         logging.info(f"{'='*60}")
-#         logging.info(f"   Total segments:          {total_segments}")
-#         logging.info(f"   ✅ Successfully encoded:   {successful_segments} ({successful_segments/total_segments*100:.1f}%)")
-#         logging.info(f"   ⚠️  Fallback placeholders:  {len(fallback_segments)} ({len(fallback_segments)/total_segments*100:.1f}%)")
-#         logging.info(f"   ❌ Missing/Failed:         {len(missing_segments)} ({len(missing_segments)/total_segments*100:.1f}%)")
-        
-#         if fallback_segments:
-#             logging.warning(f"   Fallback segment indices: {fallback_segments}")
-        
-#         if missing_segments:
-#             logging.error(f"   Missing segment indices: {missing_segments}")
-        
-#         logging.info(f"{'='*60}")
-#         logging.info(f"")
-
-#         # Handle missing segments - create emergency placeholders
-#         if missing_segments:
-#             logging.critical("🚨 CRITICAL: Some segments are completely missing!")
-#             logging.warning("🔧 Creating emergency placeholders...")
-            
-#             for seg_idx in missing_segments:
-#                 segment = vid_segments[seg_idx]
-#                 audio_path = segment_audio_paths[seg_idx]
-                
-#                 # Determine duration
-#                 duration = 5.0
-#                 if audio_path and os.path.exists(audio_path):
-#                     try:
-#                         audio_clip = AudioFileClip(audio_path)
-#                         duration = audio_clip.duration
-#                         audio_clip.close()
-#                         del audio_clip
-#                     except:
-#                         words = len(segment.get('text', '').split())
-#                         duration = max(3.0, words * 0.35)
-#                 else:
-#                     words = len(segment.get('text', '').split())
-#                     duration = max(3.0, words * 0.35)
-                
-#                 # Create emergency placeholder
-#                 try:
-#                     emergency_path = create_full_segment_fallback(
-#                         duration=duration,
-#                         canvas_w=canvas_w,
-#                         canvas_h=canvas_h,
-#                         segment_index=seg_idx,
-#                         audio_path=audio_path,
-#                         chunk_folder=chunk_folder,
-#                         reason="Emergency - segment completely missing"
-#                     )
-                    
-#                     if emergency_path and os.path.exists(emergency_path):
-#                         validated_chunks.insert(seg_idx, emergency_path)
-#                         fallback_segments.append(seg_idx)
-#                         logging.info(f"✅ Emergency placeholder inserted for segment {seg_idx}")
-#                     else:
-#                         logging.critical(f"💥 FATAL: Cannot create emergency placeholder for segment {seg_idx}")
-#                         validated_chunks.insert(seg_idx, None)
-                        
-#                 except Exception as e:
-#                     logging.critical(f"💥 Emergency placeholder creation failed for segment {seg_idx}: {e}")
-#                     logging.error(traceback.format_exc())
-#                     validated_chunks.insert(seg_idx, None)
-
-#         # Final check
-#         chunk_paths = validated_chunks
-        
-#         if not chunk_paths or None in chunk_paths:
-#             none_count = chunk_paths.count(None) if chunk_paths else total_segments
-#             error_msg = f"Video generation FAILED: {none_count}/{total_segments} segments could not be created"
-#             logging.critical(f"💥 {error_msg}")
-            
-#             # Send notification
-#             send_telegram_notification(
-#                 f"🚨 VIDEO GENERATION FAILED\n\n{error_msg}\n\nMissing segments: {missing_segments}\nFallback segments: {fallback_segments}",
-#                 "Critical Failure",
-#                 "https://claude.ai/error",
-#                 user_id or "Unknown"
-#             )
-            
-#             raise RuntimeError(error_msg)
-
-#         logging.info(f"✅ Proceeding with {len(chunk_paths)} segments")
-#         if fallback_segments:
-#             logging.warning(f"⚠️  Including {len(fallback_segments)} BLACK PLACEHOLDER segments (will need manual editing)")
-#             logging.warning(f"   Black placeholder segment indices: {fallback_segments}")
-
-#         # -------------------------------------------------
-#         # FINAL CONCAT
-#         # -------------------------------------------------
-#         logging.info("📦 Final assembly via FFmpeg concat...")
-#         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
-
-#         with open(concat_txt_path, "w") as f:
-#             for path in chunk_paths:
-#                 f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
-
-        
-#         if mode == "original" and full_audio:
-#             # -------------------------------------------------
-#             # FINAL CONCAT WITH TRANSITIONS
-#             # -------------------------------------------------
-#             logging.info("📦 Final assembly with transitions...")
-        
-#             # Configure transitions (use provided config or defaults)
-#             if transition_config is None:
-#                 transition_config = {
-#                     "enabled": False,  # Set to False to disable transitions
-#                     "duration": 0.5,  # Half-second transitions
-#                     "types": ["slideleft", "slideright", "slideup"],  # Professional set
-#                     "mode": "cycle"  # Alternate between types
-#                 }
-            
-#             whoosh_config = {
-#                 "enabled": True,
-#                 "volume": 0.6,
-#                 "transitions": ["slideleft", "slideright", "slideup", "wipeleft", "wiperight", "wipeup"],
-#                 "mp3_path": "sounds/whoosh.mp3"
-#             }
-        
-#             logging.info("🎵 Original mode — applying transitions then overlaying audio.")
-            
-#             temp_video_no_audio = os.path.join(chunk_folder, "temp_video_no_audio.mp4")
-            
-#             # Apply transitions (video only, no audio yet)
-#             apply_transitions_and_concat(
-#                 chunk_paths, 
-#                 temp_video_no_audio,
-#                 transition_config,
-#                 whoosh_config,
-#             )
-            
-#             # Overlay full audio track
-#             ffmpeg_cmd = [
-#                 "ffmpeg",
-#                 "-i", temp_video_no_audio,
-#                 "-i", full_audio,
-#                 "-c:v", "copy",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-map", "0:v:0",
-#                 "-map", "1:a:0",
-#                 "-shortest",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-            
-#             try:
-#                 subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-#                 logging.info("✅ Audio overlay completed successfully")
-#             except subprocess.CalledProcessError as e:
-#                 logging.error(f"❌ FFmpeg audio overlay failed: {e.stderr}")
-#                 raise
-            
-#             # Cleanup temp file
-#             if os.path.exists(temp_video_no_audio):
-#                 os.remove(temp_video_no_audio)
-            
-#         else:
-#             # Normal mode: simple concat
-#             logging.info("🎬 Standard concat (no transitions)")
-#             ffmpeg_cmd = [
-#                 "ffmpeg", "-f", "concat", "-safe", "0",
-#                 "-i", concat_txt_path,
-#                 "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-#                 "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M",
-#                 "-bufsize", "24M",
-#                 "-profile:v", "high", "-pix_fmt", "yuv420p",
-#                 "-colorspace", "bt709", "-color_primaries", "bt709",
-#                 "-color_trc", "bt709",
-#                 "-c:a", "aac", "-b:a", "192k",
-#                 "-movflags", "+faststart",
-#                 "-y", output_path
-#             ]
-            
-#             try:
-#                 subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-#                 logging.info("✅ Video concatenation completed successfully")
-#             except subprocess.CalledProcessError as e:
-#                 logging.error(f"❌ FFmpeg concat failed: {e.stderr}")
-#                 raise
-
-#         # -------------------------------------------------
-#         # BACKGROUND MUSIC
-#         # -------------------------------------------------
-#         if background:
-#             logging.info("🎵 Adding background music...")
-#             try:
-#                 add_background_music(output_path, background)
-#                 logging.info("✅ Background music added successfully")
-#             except Exception as e:
-#                 logging.error(f"❌ Background music addition failed: {e}")
-#                 logging.warning("⚠️  Continuing without background music")
-#         else:
-#             logging.info("ℹ️  No background music specified")
-
-#         # -------------------------------------------------
-#         # CAPTIONS/SUBTITLES
-#         # -------------------------------------------------
-#         if captions_enabled and srt and os.path.exists(srt):
-#             logging.info("📝 Burning subtitles into final video...")
-            
-#             subbed_output_path = output_path.replace(".mp4", "_subbed.mp4")
-            
-#             try:
-#                 success = burn_srt_to_video(
-#                     input_video=output_path,
-#                     srt_file=srt,
-#                     output_video=subbed_output_path,
-#                     caption_settings=caption_settings
-#                 )
-                
-#                 if success:
-#                     try:
-#                         os.remove(output_path)
-#                         os.rename(subbed_output_path, output_path)
-#                         logging.info(f"✅ Subtitles burned successfully → {output_path}")
-#                     except Exception as e:
-#                         logging.error(f"❌ Failed to replace original video: {e}")
-#                         if os.path.exists(subbed_output_path):
-#                             output_path = subbed_output_path
-#                 else:
-#                     logging.warning("⚠️  Subtitle burning failed, continuing without subtitles")
-                    
-#             except Exception as e:
-#                 logging.error(f"❌ Subtitle burning crashed: {e}")
-#                 logging.warning("⚠️  Continuing without subtitles")
-#         else:
-#             if captions_enabled:
-#                 logging.warning("⚠️  Captions enabled but no SRT file provided")
-
-#         # -------------------------------------------------
-#         # CLEANUP
-#         # -------------------------------------------------
-#         cleanup_files = ["output.srt", "temp_audio.mp3"]
-#         for f in cleanup_files:
-#             if os.path.exists(f):
-#                 try:
-#                     os.remove(f)
-#                     logging.debug(f"🧹 Cleaned up: {f}")
-#                 except Exception as e:
-#                     logging.warning(f"⚠️  Could not remove {f}: {e}")
-
-#         # -------------------------------------------------
-#         # FINAL VALIDATION
-#         # -------------------------------------------------
-#         if os.path.exists(output_path):
-#             final_size = os.path.getsize(output_path)
-#             if final_size < 100000:  # Less than 100KB is suspicious
-#                 logging.error(f"⚠️  Final video file is suspiciously small: {final_size} bytes")
-#             else:
-#                 logging.info(f"✅ Final video size: {final_size / (1024*1024):.2f} MB")
-        
-#         logging.info(f"")
-#         logging.info(f"{'='*60}")
-#         logging.info(f"🎉 VIDEO GENERATION COMPLETE")
-#         logging.info(f"{'='*60}")
-#         logging.info(f"   Output: {output_path}")
-#         logging.info(f"   Total segments: {total_segments}")
-#         logging.info(f"   Successful: {successful_segments}")
-#         logging.info(f"   Fallbacks: {len(fallback_segments)}")
-#         if fallback_segments:
-#             logging.info(f"   ⚠️  BLACK SEGMENTS: {fallback_segments}")
-#             logging.info(f"   ⚠️  These segments need manual editing!")
-#         logging.info(f"{'='*60}")
-#         logging.info(f"")
-
-#         return (
-#             output_path,
-#             (timestamp if mode in ["create", "commentary", "original"] else asset_folder),
-#             lambda: print("✅ Done!")
-#         )
-
-#     except Exception as e:
-#         full_trace = traceback.format_exc()
-#         logging.error(f"🚨 Video generation error:\n{full_trace}")
-
-#         send_telegram_notification(
-#             f"🚨 VIDEO GENERATION FAILED\n\nError: {str(e)}\n\nFull trace:\n{full_trace[:500]}",
-#             "Failure",
-#             "https://claude.ai/error",
-#             user_id or "Unknown",
-#         )
-        
-#         return None, None, None
-    
-#     finally:
-#         # Final cleanup
-#         if torch.cuda.is_available():
-#             torch.cuda.empty_cache()
-#         gc.collect()
-#         logging.info("🧹 Final cleanup completed")
 
 from whisk_character_handler import (
     initialize_whisk_character,
     whisk_generate_for_segment,
     Whisk401Error
 )
+
+
+"""
+BACKEND PATCH  —  paste these two blocks into create_video.py
+
+1. Replace the canvas_w / canvas_h block inside create_video()
+2. Replace _composite_avatar_over_full_video() entirely
+
+Changes vs original
+───────────────────
+• canvas_w / canvas_h now read from layout_config["canvas"] first,
+  then fall back to the orientation preset — so free-form canvas
+  sizes sent by the frontend are honoured exactly.
+
+• Border is read from avatar_layer / content_layer dicts.
+  Fields:  width (int px), color (hex str), style (str, ignored by
+  FFmpeg — drawbox only supports solid), radius (int px).
+  radius is applied with a rounded_rect workaround (overlay approach).
+
+• background="image:<url>" and "video:<url>" are handled:
+  the media is fetched via the url and used as a static overlay.
+
+• No silent clamping anywhere — what the frontend sends is exactly
+  what FFmpeg receives.
+"""
+
+# ─────────────────────────────────────────────────────────────────
+# 1. CANVAS SIZE BLOCK  (replaces the CURRENT_WIDTH/HEIGHT block)
+#    inside create_video(), after the orientation is set
+# ─────────────────────────────────────────────────────────────────
+
+# REPLACE THIS BLOCK in create_video():
+#
+#   CURRENT_ORIENTATION = orientation.lower().strip()
+#   if CURRENT_ORIENTATION == "portrait":
+#       CURRENT_WIDTH  = 1080
+#       CURRENT_HEIGHT = 1920
+#   else:
+#       CURRENT_WIDTH  = 1920
+#       CURRENT_HEIGHT = 1080
+#   canvas_w = CURRENT_WIDTH
+#   canvas_h = CURRENT_HEIGHT
+#
+# WITH:
+
+def _resolve_canvas(orientation, layout_config):
+    """
+    Canvas dimensions in priority order:
+      1. layout_config["canvas"] sent by frontend (free-form)
+      2. Standard orientation preset
+    Always integers, always >= 320 on each axis.
+    """
+    if layout_config and "canvas" in layout_config:
+        w = int(layout_config["canvas"].get("width",  0))
+        h = int(layout_config["canvas"].get("height", 0))
+        if w >= 320 and h >= 320:
+            return w, h
+
+    # Fallback to orientation preset
+    orient = (orientation or "landscape").lower().strip()
+    if orient == "portrait":
+        return 1080, 1920
+    return 1920, 1080
+
+"""
+BACKEND PATCH  —  paste these two blocks into create_video.py
+
+1. Replace the canvas_w / canvas_h block inside create_video()
+2. Replace _composite_avatar_over_full_video() entirely
+
+Changes vs original
+───────────────────
+• canvas_w / canvas_h now read from layout_config["canvas"] first,
+  then fall back to the orientation preset — so free-form canvas
+  sizes sent by the frontend are honoured exactly.
+
+• Border is read from avatar_layer / content_layer dicts.
+  Fields:  width (int px), color (hex str), style (str, ignored by
+  FFmpeg — drawbox only supports solid), radius (int px).
+  radius is applied with a rounded_rect workaround (overlay approach).
+
+• background="image:<url>" and "video:<url>" are handled:
+  the media is fetched via the url and used as a static overlay.
+
+• No silent clamping anywhere — what the frontend sends is exactly
+  what FFmpeg receives.
+"""
+
+# ─────────────────────────────────────────────────────────────────
+# 1. CANVAS SIZE BLOCK  (replaces the CURRENT_WIDTH/HEIGHT block)
+#    inside create_video(), after the orientation is set
+# ─────────────────────────────────────────────────────────────────
+
+# REPLACE THIS BLOCK in create_video():
+#
+#   CURRENT_ORIENTATION = orientation.lower().strip()
+#   if CURRENT_ORIENTATION == "portrait":
+#       CURRENT_WIDTH  = 1080
+#       CURRENT_HEIGHT = 1920
+#   else:
+#       CURRENT_WIDTH  = 1920
+#       CURRENT_HEIGHT = 1080
+#   canvas_w = CURRENT_WIDTH
+#   canvas_h = CURRENT_HEIGHT
+#
+# WITH:
+
+def _resolve_canvas(orientation, layout_config):
+    """
+    Canvas dimensions in priority order:
+      1. layout_config["canvas"] sent by frontend (free-form)
+      2. Standard orientation preset
+    Always integers, always >= 320 on each axis.
+    """
+    if layout_config and "canvas" in layout_config:
+        w = int(layout_config["canvas"].get("width",  0))
+        h = int(layout_config["canvas"].get("height", 0))
+        if w >= 320 and h >= 320:
+            return w, h
+
+    # Fallback to orientation preset
+    orient = (orientation or "landscape").lower().strip()
+    if orient == "portrait":
+        return 1080, 1920
+    return 1920, 1080
+
+"""
+BACKEND PATCH  —  paste these two blocks into create_video.py
+
+1. Replace the canvas_w / canvas_h block inside create_video()
+2. Replace _composite_avatar_over_full_video() entirely
+
+Changes vs original
+───────────────────
+• canvas_w / canvas_h now read from layout_config["canvas"] first,
+  then fall back to the orientation preset — so free-form canvas
+  sizes sent by the frontend are honoured exactly.
+
+• Border is read from avatar_layer / content_layer dicts.
+  Fields:  width (int px), color (hex str), style (str, ignored by
+  FFmpeg — drawbox only supports solid), radius (int px).
+  radius is applied with a rounded_rect workaround (overlay approach).
+
+• background="image:<url>" and "video:<url>" are handled:
+  the media is fetched via the url and used as a static overlay.
+
+• No silent clamping anywhere — what the frontend sends is exactly
+  what FFmpeg receives.
+"""
+
+# ─────────────────────────────────────────────────────────────────
+# 1. CANVAS SIZE BLOCK  (replaces the CURRENT_WIDTH/HEIGHT block)
+#    inside create_video(), after the orientation is set
+# ─────────────────────────────────────────────────────────────────
+
+# REPLACE THIS BLOCK in create_video():
+#
+#   CURRENT_ORIENTATION = orientation.lower().strip()
+#   if CURRENT_ORIENTATION == "portrait":
+#       CURRENT_WIDTH  = 1080
+#       CURRENT_HEIGHT = 1920
+#   else:
+#       CURRENT_WIDTH  = 1920
+#       CURRENT_HEIGHT = 1080
+#   canvas_w = CURRENT_WIDTH
+#   canvas_h = CURRENT_HEIGHT
+#
+# WITH:
+
+def _resolve_canvas(orientation, layout_config):
+    """
+    Canvas dimensions in priority order:
+      1. layout_config["canvas"] sent by frontend (free-form)
+      2. Standard orientation preset
+    Always integers, always >= 320 on each axis.
+    """
+    if layout_config and "canvas" in layout_config:
+        w = int(layout_config["canvas"].get("width",  0))
+        h = int(layout_config["canvas"].get("height", 0))
+        if w >= 320 and h >= 320:
+            return w, h
+
+    # Fallback to orientation preset
+    orient = (orientation or "landscape").lower().strip()
+    if orient == "portrait":
+        return 1080, 1920
+    return 1920, 1080
+
+
+import subprocess
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import json
+import time
+import logging
+import tempfile
+import subprocess
+
+def _dreamface_skip_narration_media_pool(layout_config, avatar_segment_map) -> bool:
+    """Full-screen avatar renders do not use Pexels/ImageFX narration assets."""
+    return bool(
+        avatar_segment_map
+        and isinstance(layout_config, dict)
+        and (layout_config.get("layout_id") or "") == "full_avatar"
+    )
+
+
+def _quick_video_file_ok(path, min_bytes=10000) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < min_bytes:
+        return False
+    return _probe_stream_duration(path, "video") > 0 or _probe_media_duration(path) > 0
+
+
+def _verify_video_decodable(path, timeout=45) -> bool:
+    """True if ffmpeg can decode at least one video frame (catches Grok/NVENC glitches)."""
+    if not path or not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < 1000:
+        return False
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-nostats",
+                "-fflags", "+discardcorrupt",
+                "-i", path,
+                "-map", "0:v:0",
+                "-frames:v", "1",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            logging.warning(
+                "Video decode check failed | %s | %s",
+                os.path.basename(path),
+                (r.stderr or "").strip()[-400:],
+            )
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        logging.warning("Video decode check timed out: %s", path)
+        return False
+    except Exception as exc:
+        logging.warning("Video decode check error for %s: %s", path, exc)
+        return False
+
+
+def _repair_clip_source_for_encode(src, dst) -> bool:
+    """Re-mux/transcode a broken clip so segment encode can read it."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-i", src,
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        dst,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 1000:
+            logging.warning(
+                "CLIP source repair failed | %s | %s",
+                os.path.basename(src),
+                (r.stderr or "").strip()[-500:],
+            )
+            return False
+        if not _verify_video_decodable(dst, timeout=60):
+            return False
+        logging.info("🔧 Repaired CLIP source for encode | %s", os.path.basename(src))
+        return True
+    except subprocess.TimeoutExpired:
+        logging.warning("CLIP source repair timed out: %s", src)
+        return False
+    except Exception as exc:
+        logging.warning("CLIP source repair error for %s: %s", src, exc)
+        return False
+
+
+def _append_tagged_clip_to_media_pool(media_pool, result, video_path):
+    """CLIP/tagged sources only need path + duration — no CLIP embedding."""
+    duration = _probe_media_duration(video_path)
+    if duration <= 0:
+        duration = _probe_stream_duration(video_path, "video") or 0.0
+    if duration <= 0:
+        return False
+    media_pool.append(
+        {
+            "type": "video",
+            "path": video_path,
+            "character": result["character"],
+            "embedding": None,
+            "mute": result.get("mute", False),
+            "duration": duration,
+            "tag": result.get("tag"),
+        }
+    )
+    return True
+
+
+def _probe_media_duration(path):
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            capture_output=True, text=True,
+        )
+        for s in json.loads(r.stdout).get("streams", []):
+            d = float(s.get("duration", 0))
+            if d > 0:
+                return d
+    except Exception as e:
+        logging.warning(f"probe_duration failed for {path}: {e}")
+    return 0.0
+
+def _is_clip_segment(seg):
+    text = (seg.get("text") or "").strip()
+    return text.startswith("[CLIP:") and text.endswith("]")
+
+
+def _has_clip_segments(vid_segments):
+    return any(_is_clip_segment(seg) for seg in (vid_segments or []))
+
+def _clip_has_audio(path):
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            capture_output=True, text=True,
+        )
+        return any(
+            s.get("codec_type") == "audio"
+            for s in json.loads(r.stdout).get("streams", [])
+        )
+    except Exception:
+        return False
+
+def _probe_stream_duration(path, codec_type=None):
+    """Duration of the first matching stream, else container format duration."""
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-show_format", path,
+            ],
+            capture_output=True, text=True,
+        )
+        data = json.loads(r.stdout)
+        for s in data.get("streams", []):
+            if codec_type and s.get("codec_type") != codec_type:
+                continue
+            d = float(s.get("duration") or 0)
+            if d > 0:
+                return d
+        d = float(data.get("format", {}).get("duration") or 0)
+        if d > 0:
+            return d
+    except Exception as e:
+        logging.warning(f"probe_stream_duration failed for {path}: {e}")
+    return 0.0
+
+def _probe_audio_duration(path):
+    d = _probe_stream_duration(path, "audio")
+    if d > 0:
+        return d
+    return _probe_stream_duration(path, "video") or _probe_media_duration(path)
+
+def _drawbox(x, y, w, h, border_w, color_hex, radius):
+    t   = max(1, min(border_w, min(w, h) // 2))
+    col = f"{color_hex}@1.0"
+    if radius <= 0:
+        return f"drawbox=x={x}:y={y}:w={w}:h={h}:color={col}:t={t}"
+    r = max(1, min(radius, w // 2, h // 2))
+    return ",".join([
+        f"drawbox=x={x+r}:y={y}:w={w-2*r}:h={t}:color={col}:t=fill",
+        f"drawbox=x={x+r}:y={y+h-t}:w={w-2*r}:h={t}:color={col}:t=fill",
+        f"drawbox=x={x}:y={y+r}:w={t}:h={h-2*r}:color={col}:t=fill",
+        f"drawbox=x={x+w-t}:y={y+r}:w={t}:h={h-2*r}:color={col}:t=fill",
+    ])
+
+
+def _normalize_fit_mode(value, default="cover"):
+    mode = str(value or default).lower().strip()
+    if mode in ("cover", "contain", "fill"):
+        return mode
+    return default
+
+
+def _ffmpeg_content_box_filter(in_label, out_label, w, h, fit_mode="cover", pad_color="black"):
+    """
+    Scale content into a box — cover (crop), contain, or fill (stretch).
+
+    contain never leaves dark bars: the whole frame is fitted inside the box and
+    the empty sides show a blurred, slightly dimmed cover copy of the same
+    playing video (pad_color is kept for call compatibility only).
+    """
+    fit_mode = _normalize_fit_mode(fit_mode, "cover")
+    if fit_mode == "contain":
+        bw = max(2, (w // 16) // 2 * 2)
+        bh = max(2, (h // 16) // 2 * 2)
+        o = out_label
+        return (
+            f"[{in_label}]split=2[{o}_fg][{o}_bg];"
+            f"[{o}_bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+            f"scale={bw}:{bh}:flags=area,boxblur=2:1,"
+            f"scale={w}:{h}:flags=bicubic,eq=brightness=-0.06:saturation=0.9,"
+            f"setsar=1,format=yuv420p[{o}_blur];"
+            f"[{o}_fg]scale={w}:{h}:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2:flags=lanczos,setsar=1,format=yuv420p[{o}_fit];"
+            f"[{o}_blur][{o}_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[{o}]"
+        )
+    if fit_mode == "fill":
+        return (
+            f"[{in_label}]scale={w}:{h}:flags=lanczos,"
+            f"setsar=1,format=yuv420p[{out_label}]"
+        )
+    return (
+        f"[{in_label}]scale={w}:{h}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h},setsar=1,format=yuv420p[{out_label}]"
+    )
+
+
+def _ffmpeg_avatar_box_filter(in_label, out_label, w, h):
+    """
+    Avatar never stretches — contain in box; letterbox/pillarbox filled with
+    a blurred cover crop of the same avatar frame.
+    """
+    bw = max(w // 8, 2)
+    bh = max(h // 8, 2)
+    return (
+        f"[{in_label}]split=2[{out_label}_fg][{out_label}_bg];"
+        f"[{out_label}_bg]scale={w}:{h}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h},"
+        f"scale={bw}:{bh}:flags=bilinear,"
+        f"scale={w}:{h}:flags=bilinear,"
+        f"setsar=1,format=yuv420p[{out_label}_blur];"
+        f"[{out_label}_fg]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"setsar=1,format=yuv420p[{out_label}_fgfit];"
+        f"[{out_label}_blur][{out_label}_fgfit]overlay=(W-w)/2:(H-h)/2,"
+        f"setsar=1,format=yuv420p[{out_label}]"
+    )
+
+
+def _thc_v2_config(layout_geom):
+    """layout_config when it carries a Talking Heads canvas design (style_version 2)."""
+    cfg = layout_geom.get("layout_config") if isinstance(layout_geom, dict) else None
+    try:
+        if isinstance(cfg, dict) and int(cfg.get("style_version") or 1) >= 2 and isinstance(cfg.get("design"), dict):
+            return cfg
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _thc_fx(layout_geom, canvas_w, canvas_h, mode, chunk_folder, first_input):
+    """CanvasFx for designed canvases (None → classic rendering, unchanged)."""
+    cfg = _thc_v2_config(layout_geom)
+    if not cfg:
+        return None
+    try:
+        from helper.talking_heads_canvas import CanvasFx
+
+        static_root = os.getenv("STATIC_ROOT") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "static"
+        )
+        return CanvasFx.for_layout(
+            cfg, canvas_w, canvas_h, mode, chunk_folder,
+            first_input=first_input, static_root=static_root,
+        )
+    except Exception as exc:
+        logging.warning(f"⚠️  Canvas design unavailable — classic layout used: {exc}")
+        return None
+
+
+def _thc_bg_scale(layout_geom, canvas_w, canvas_h):
+    """Image/video backgrounds: designed canvases cover (like the studio preview)."""
+    if _thc_v2_config(layout_geom):
+        return (
+            f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={canvas_w}:{canvas_h}"
+        )
+    return f"scale={canvas_w}:{canvas_h}:flags=lanczos"
+
+
+def _thc_count_inputs(args):
+    return sum(1 for a in args if a == "-i")
+
+
+def _extract_layout_geometry(layout_config, canvas_w, canvas_h):
+    import re
+
+    layout_id     = layout_config.get("layout_id", "")
+    avatar_layer  = layout_config.get("avatar_layer") or {}
+    content_layer = layout_config.get("content_layer")
+    clip_layer    = layout_config.get("clip_layer")
+    background    = layout_config.get("background", "#0a0a0a")
+    content_fit   = _normalize_fit_mode(layout_config.get("content_fit"), "cover")
+    clip_fit      = _normalize_fit_mode(layout_config.get("clip_fit"), "contain")
+
+    av_x = int(avatar_layer.get("x", 0))
+    av_y = int(avatar_layer.get("y", 0))
+    av_w = int(avatar_layer.get("width", 320))
+    av_h = int(avatar_layer.get("height", 450))
+
+    av_border        = avatar_layer.get("border", {}) or {}
+    av_border_w      = max(0, int(av_border.get("width", 0)))
+    av_border_color  = av_border.get("color", "#ffffff").lstrip("#")
+    av_border_radius = max(0, int(av_border.get("radius", 0)))
+    if not re.match(r"^[0-9a-fA-F]{6}$", av_border_color):
+        av_border_color = "ffffff"
+
+    ct_x = ct_y = ct_w = ct_h = 0
+    ct_border_w = ct_border_radius = 0
+    ct_border_color = "ffffff"
+
+    if content_layer:
+        ct_x = int(content_layer.get("x", 0))
+        ct_y = int(content_layer.get("y", 0))
+        ct_w = int(content_layer.get("width", canvas_w))
+        ct_h = int(content_layer.get("height", canvas_h))
+        ct_border        = content_layer.get("border", {}) or {}
+        ct_border_w      = max(0, int(ct_border.get("width", 0)))
+        ct_border_color  = ct_border.get("color", "#ffffff").lstrip("#")
+        ct_border_radius = max(0, int(ct_border.get("radius", 0)))
+        if not re.match(r"^[0-9a-fA-F]{6}$", ct_border_color):
+            ct_border_color = "ffffff"
+
+    cl_x = cl_y = cl_w = cl_h = 0
+    cl_border_w = cl_border_radius = 0
+    cl_border_color = "ffffff"
+
+    if clip_layer:
+        cl_x = int(clip_layer.get("x", 0))
+        cl_y = int(clip_layer.get("y", 0))
+        cl_w = int(clip_layer.get("width", canvas_w))
+        cl_h = int(clip_layer.get("height", canvas_h))
+        cl_border        = clip_layer.get("border", {}) or {}
+        cl_border_w      = max(0, int(cl_border.get("width", 0)))
+        cl_border_color  = cl_border.get("color", "#ffffff").lstrip("#")
+        cl_border_radius = max(0, int(cl_border.get("radius", 0)))
+        if not re.match(r"^[0-9a-fA-F]{6}$", cl_border_color):
+            cl_border_color = "ffffff"
+    elif content_layer and ct_w > 0 and ct_h > 0:
+        cl_w, cl_h = ct_w, ct_h
+        cl_x = round((canvas_w - cl_w) / 2)
+        cl_y = round((canvas_h - cl_h) / 2)
+        cl_border_w = ct_border_w
+        cl_border_color = ct_border_color
+        cl_border_radius = ct_border_radius
+    else:
+        cl_w, cl_h = canvas_w, canvas_h
+        cl_x = cl_y = 0
+
+    PREVIEW_W    = 560
+    border_scale = canvas_w / PREVIEW_W
+    av_border_w      = max(0, round(av_border_w * border_scale))
+    av_border_radius = max(0, round(av_border_radius * border_scale))
+    ct_border_w      = max(0, round(ct_border_w * border_scale))
+    ct_border_radius = max(0, round(ct_border_radius * border_scale))
+    cl_border_w      = max(0, round(cl_border_w * border_scale))
+    cl_border_radius = max(0, round(cl_border_radius * border_scale))
+
+    bg_type  = "color"
+    bg_color = "0a0a0a"
+    bg_url   = None
+
+    if re.match(r"^#[0-9a-fA-F]{6}$", str(background)):
+        bg_type  = "color"
+        bg_color = background.lstrip("#")
+    elif background == "blurred":
+        bg_type = "blurred"
+    elif str(background).startswith("image:"):
+        bg_type = "image"
+        bg_url  = str(background)[6:]
+    elif str(background).startswith("video:"):
+        bg_type = "bgvideo"
+        bg_url  = str(background)[6:]
+
+    logging.info(
+        f"🖼️  layout={layout_id} | canvas={canvas_w}x{canvas_h} | bg={background}\n"
+        f"   avatar  : ({av_x},{av_y}) {av_w}x{av_h} border={av_border_w}px\n"
+        f"   content : ({ct_x},{ct_y}) {ct_w}x{ct_h} border={ct_border_w}px\n"
+        f"   clip    : ({cl_x},{cl_y}) {cl_w}x{cl_h} border={cl_border_w}px\n"
+        f"   fit     : content={content_fit} clip={clip_fit}"
+    )
+
+    return {
+        "layout_id":        layout_id,
+        "content_fit":      content_fit,
+        "clip_fit":         clip_fit,
+        "av_x": av_x, "av_y": av_y, "av_w": av_w, "av_h": av_h,
+        "av_border_w": av_border_w,
+        "av_border_color": av_border_color,
+        "av_border_radius": av_border_radius,
+        "ct_x": ct_x, "ct_y": ct_y, "ct_w": ct_w, "ct_h": ct_h,
+        "ct_border_w": ct_border_w,
+        "ct_border_color": ct_border_color,
+        "ct_border_radius": ct_border_radius,
+        "cl_x": cl_x, "cl_y": cl_y, "cl_w": cl_w, "cl_h": cl_h,
+        "cl_border_w": cl_border_w,
+        "cl_border_color": cl_border_color,
+        "cl_border_radius": cl_border_radius,
+        "bg_type": bg_type,
+        "bg_color": bg_color,
+        "bg_url": bg_url,
+        "content_layer": content_layer,
+        "clip_layer": clip_layer,
+        "layout_config": layout_config,
+    }
+
+
+def _fetch_bg_media(url, suffix, chunk_folder):
+    import urllib.request
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=suffix, dir=chunk_folder
+        )
+        urllib.request.urlretrieve(url, tmp.name)
+        return tmp.name
+    except Exception as e:
+        logging.warning(f"⚠️  BG fetch failed: {e}")
+        return None
+
+# ════════════════════════════════════════════════════════════════════════
+# CLIP VIDEOS — batch-level composite (NEW)
+#
+# No avatar_start, no per-segment slicing, no duration prediction.
+#
+# For each avatar batch:
+#   1. Group its consecutive narration segments together
+#   2. Concat their content chunks into one block
+#   3. Take the WHOLE avatar batch file as-is (video + its own audio)
+#   4. Compare lengths AFTER THE FACT:
+#        avatar shorter than content block → trim content block
+#        avatar longer  than content block → loop content block
+#        equal                             → nothing extra
+#   5. Composite: avatar plays naturally, content fitted behind/around it,
+#      avatar's own audio is the ONLY audio for this block.
+#
+# Clip segments (`[CLIP:...]`) are untouched — layout only, original audio.
+# ════════════════════════════════════════════════════════════════════════
+
+def _group_batches_from_map(avatar_segment_map):
+    """
+    batch_index → sorted list of seg_index values (contiguous run).
+    """
+    groups = {}
+    for raw_idx, info in avatar_segment_map.items():
+        seg_idx = int(raw_idx)
+        b = info["batch_index"]
+        groups.setdefault(b, {"path": info["path"], "seg_indices": []})
+        groups[b]["seg_indices"].append(seg_idx)
+
+    for b in groups.values():
+        b["seg_indices"].sort()
+
+    return groups
+
+
+def _concat_chunks(chunk_list, chunk_folder, tag):
+    """
+    Plain concat of already-uniform chunks (same codec/fps/pix_fmt —
+    guaranteed by Rule 1 narration encode). Stream copy.
+    """
+    if not chunk_list:
+        return None
+
+    if len(chunk_list) == 1:
+        return chunk_list[0]
+
+    concat_txt = os.path.join(chunk_folder, f"block_concat_{tag}_{int(time.time()*1000)}.txt")
+    out_path   = os.path.join(chunk_folder, f"block_{tag}_{int(time.time()*1000)}.mp4")
+
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for p in chunk_list:
+            f.write(f"file '{os.path.abspath(p).replace(os.sep, '/')}'\n")
+
+    r = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_txt,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        out_path,
+    ], capture_output=True, text=True)
+
+    try:
+        os.remove(concat_txt)
+    except Exception:
+        pass
+
+    if r.returncode != 0 or not os.path.exists(out_path):
+        logging.error(f"❌ Block concat failed ({tag}):\n{r.stderr[-500:]}")
+        return None
+
+    return out_path
+
+def _full_avatar_uses_full_bleed(layout_geom, canvas_w, canvas_h) -> bool:
+    if not layout_geom:
+        return True
+    return (
+        int(layout_geom.get("av_x", 0)) <= 1
+        and int(layout_geom.get("av_y", 0)) <= 1
+        and int(layout_geom.get("av_w", canvas_w)) >= canvas_w - 2
+        and int(layout_geom.get("av_h", canvas_h)) >= canvas_h - 2
+    )
+
+
+def _composite_full_avatar_from_normalized_avatar(
+    avatar_normalized: str,
+    canvas_w: int,
+    canvas_h: int,
+    chunk_folder: str,
+    tag: str,
+    layout_geom=None,
+) -> str | None:
+    """Avatar-only composite (no narration B-roll) using avatar_layer box from studio."""
+    if not avatar_normalized or not os.path.exists(avatar_normalized):
+        return None
+
+    ts = int(time.time() * 1000)
+    geom = layout_geom or {}
+    avatar_dur = _probe_media_duration(avatar_normalized) or 1.0
+    dur_s = f"{avatar_dur:.4f}"
+
+    av_x = int(geom.get("av_x", 0))
+    av_y = int(geom.get("av_y", 0))
+    av_w = int(geom.get("av_w", canvas_w))
+    av_h = int(geom.get("av_h", canvas_h))
+    bg_type = geom.get("bg_type", "color")
+    bg_color = geom.get("bg_color", "0a0a0a")
+
+    parts: list[str] = []
+    current = "base"
+    inputs = ["-i", avatar_normalized]
+    next_idx = 1
+    bg_media = None
+    temp_bg = None
+
+    if not _thc_v2_config(geom) and _full_avatar_uses_full_bleed(geom, canvas_w, canvas_h) and bg_type not in (
+        "image",
+        "bgvideo",
+    ):
+        filt = _ffmpeg_avatar_box_filter("0:v", "vout", canvas_w, canvas_h)
+        filter_complex = filt
+        final_label = "vout"
+    else:
+        if bg_type == "image" and geom.get("bg_url"):
+            temp_bg = _fetch_bg_media(geom["bg_url"], ".jpg", chunk_folder)
+            bg_media = temp_bg
+        elif bg_type == "bgvideo" and geom.get("bg_url"):
+            temp_bg = _fetch_bg_media(geom["bg_url"], ".mp4", chunk_folder)
+            bg_media = temp_bg
+
+        avatar_in = "0:v"
+        if bg_type == "blurred":
+            parts.append(
+                f"[0:v]split=2[avsrc][bgsrc];"
+                f"[bgsrc]scale={canvas_w//8}:{canvas_h//8}:flags=bilinear,"
+                f"scale={canvas_w}:{canvas_h}:flags=bilinear,"
+                f"setsar=1,format=yuv420p[base]"
+            )
+            avatar_in = "avsrc"
+        elif bg_type == "color":
+            parts.append(
+                f"color=c=#{bg_color}:s={canvas_w}x{canvas_h}:r=30:d={dur_s},"
+                f"format=yuv420p[base]"
+            )
+        elif bg_type == "image" and bg_media:
+            parts.append(
+                f"[{next_idx}:v]{_thc_bg_scale(geom, canvas_w, canvas_h)},"
+                f"setsar=1,format=yuv420p[base]"
+            )
+            inputs += ["-i", bg_media]
+            next_idx += 1
+        elif bg_type == "bgvideo" and bg_media:
+            parts.append(
+                f"[{next_idx}:v]{_thc_bg_scale(geom, canvas_w, canvas_h)},"
+                f"trim=duration={dur_s},setsar=1,format=yuv420p[base]"
+            )
+            inputs = ["-i", avatar_normalized]
+            if bg_type == "bgvideo":
+                inputs += ["-stream_loop", "-1"]
+            inputs += ["-i", bg_media]
+            next_idx = 2
+        else:
+            parts.append(
+                f"color=c=#0a0a0a:s={canvas_w}x{canvas_h}:r=30:d={dur_s},"
+                f"format=yuv420p[base]"
+            )
+
+        fx = _thc_fx(geom, canvas_w, canvas_h, "narration", chunk_folder, _thc_count_inputs(inputs))
+        if fx:
+            current = fx.after_base(parts, current)
+        parts.append(_ffmpeg_avatar_box_filter(avatar_in, "av", av_w, av_h))
+        av_label = fx.mask_layer(parts, "avatar", "av") if fx else "av"
+        parts.append(
+            f"[{current}][{av_label}]overlay=x={av_x}:y={av_y}:format=yuv420[after_av]"
+        )
+        current = "after_av"
+        if not fx and int(geom.get("av_border_w", 0)) > 0:
+            db = _drawbox(
+                av_x,
+                av_y,
+                av_w,
+                av_h,
+                geom.get("av_border_w", 0),
+                geom.get("av_border_color", "ffffff"),
+                geom.get("av_border_radius", 0),
+            )
+            parts.append(f"[{current}]{db}[after_av_border]")
+            current = "after_av_border"
+        if fx:
+            current = fx.finish(parts, current)
+            inputs += fx.input_args()
+        filter_complex = ";".join(parts)
+        final_label = current
+
+    visual_path = os.path.join(chunk_folder, f"fullav_vis_{tag}_{ts}.mp4")
+
+    cmd_visual = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{final_label}]",
+        "-an",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "constqp",
+        "-qp", "18",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        visual_path,
+    ]
+    r_visual = subprocess.run(cmd_visual, capture_output=True, text=True)
+
+    if temp_bg and os.path.exists(temp_bg):
+        try:
+            os.remove(temp_bg)
+        except Exception:
+            pass
+    if r_visual.returncode != 0 or not os.path.exists(visual_path):
+        logging.error(
+            f"❌ full_avatar visual {tag} failed:\n{(r_visual.stderr or '')[-800:]}"
+        )
+        return None
+
+    output_path = os.path.join(chunk_folder, f"fullav_{tag}_{ts}.mp4")
+    cmd_mux = [
+        "ffmpeg", "-y",
+        "-i", visual_path,
+        "-i", avatar_normalized,
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    r_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+    for p in (visual_path,):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    if r_mux.returncode != 0 or not os.path.exists(output_path):
+        logging.error(
+            f"❌ full_avatar mux {tag} failed:\n{(r_mux.stderr or '')[-800:]}"
+        )
+        return None
+
+    out_dur = _probe_media_duration(output_path)
+    logging.info(
+        f"⚡ full_avatar batch {tag} | avatar-only composite | out={out_dur:.3f}s"
+    )
+    return output_path
+
+
+def _normalize_avatar_batch_input(avatar_batch_path, chunk_folder, tag):
+    """Pass 0 — PTS=0 remux (shared by batch composite paths)."""
+    ts = int(time.time() * 1000)
+    avatar_normalized = os.path.join(chunk_folder, f"avnorm_{tag}_{ts}.mp4")
+    cmd_norm = [
+        "ffmpeg", "-y",
+        "-i", avatar_batch_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        avatar_normalized,
+    ]
+    r_norm = subprocess.run(cmd_norm, capture_output=True, text=True)
+    if r_norm.returncode != 0 or not os.path.exists(avatar_normalized):
+        logging.error(
+            f"❌ Avatar normalize failed ({tag}):\n{(r_norm.stderr or '')[-600:]}"
+        )
+        return None
+    return avatar_normalized
+
+
+def _composite_full_avatar_batch_block(
+    avatar_batch_path,
+    layout_geom,
+    canvas_w,
+    canvas_h,
+    chunk_folder,
+    tag,
+):
+    avatar_normalized = _normalize_avatar_batch_input(
+        avatar_batch_path, chunk_folder, tag
+    )
+    if not avatar_normalized:
+        return None
+    out = _composite_full_avatar_from_normalized_avatar(
+        avatar_normalized,
+        canvas_w,
+        canvas_h,
+        chunk_folder,
+        tag,
+        layout_geom=layout_geom,
+    )
+    try:
+        os.remove(avatar_normalized)
+    except Exception:
+        pass
+    return out
+
+
+def _composite_batch_block(
+    content_block,
+    avatar_batch_path,
+    layout_geom,
+    canvas_w,
+    canvas_h,
+    chunk_folder,
+    tag,
+):
+    """
+    One avatar batch ↔ one content block. Mirrors the confirmed
+    non-drifting zoom2 reference:
+
+    Pass 0: normalize avatar input to PTS=0 via -c copy
+            -avoid_negative_ts make_zero (zoom2 gets this for free
+            from concat_avatars; here it's a single-file remux).
+    Pass 1: fit content_block to exactly avatar_dur (separate, isolated
+            ffmpeg call — loop or trim, no filtergraph, no shared inputs).
+    Pass 2: composite content_fitted + avatar video (re-encoded, scaled,
+            positioned) — VIDEO ONLY, no audio mapped. Avatar video PTS
+            passed through as-is (no setpts=PTS-STARTPTS), same as zoom2's
+            [1:v]scale=... .
+    Pass 3: mux avatar's normalized audio in via -c:a copy (no re-encode).
+
+    Avatar plays naturally start-to-finish, exactly as DreamFace made it.
+    Avatar's own (untouched) audio is the only audio for this block.
+    """
+    layout_id = layout_geom["layout_id"]
+
+    if layout_id == "full_avatar":
+        logging.info(f"⚡ Batch block {tag}: full_avatar — skipping narration content")
+        return _composite_full_avatar_batch_block(
+            avatar_batch_path,
+            layout_geom,
+            canvas_w,
+            canvas_h,
+            chunk_folder,
+            tag,
+        )
+
+    avatar_dur  = _probe_media_duration(avatar_batch_path)
+    content_dur = _probe_media_duration(content_block)
+
+    if avatar_dur <= 0:
+        logging.error(f"❌ Batch block {tag}: avatar batch has no duration")
+        return None
+    if content_dur <= 0:
+        logging.error(f"❌ Batch block {tag}: content block has no duration")
+        return None
+
+    if layout_id == "full_content":
+        return content_block
+
+    ts = int(time.time() * 1000)
+
+    avatar_normalized = _normalize_avatar_batch_input(
+        avatar_batch_path, chunk_folder, tag
+    )
+    if not avatar_normalized:
+        logging.error(f"❌ Batch block {tag}: avatar normalize failed")
+        return None
+
+    norm_dur = _probe_media_duration(avatar_normalized)
+    if norm_dur > 0:
+        avatar_dur = norm_dur
+    logging.info(f"   {tag}: avatar normalized | {avatar_dur:.3f}s")
+
+    # ────────────────────────────────────────────────────────────────────
+    # PASS 1 — fit content_block to exactly avatar_dur
+    # Isolated call: single input, no filtergraph shared with avatar.
+    # ────────────────────────────────────────────────────────────────────
+    content_fitted = os.path.join(chunk_folder, f"fit_{tag}_{ts}.mp4")
+
+    if content_dur < avatar_dur - 0.01:
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", content_block,
+            "-t", f"{avatar_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "loop"
+    elif content_dur > avatar_dur + 0.01:
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-i", content_block,
+            "-t", f"{avatar_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "trim"
+    else:
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-i", content_block,
+            "-t", f"{avatar_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "exact"
+
+    r_fit = subprocess.run(cmd_fit, capture_output=True, text=True)
+    if r_fit.returncode != 0 or not os.path.exists(content_fitted):
+        logging.error(f"❌ Batch block {tag}: content fit ({fit_mode}) failed:\n{r_fit.stderr[-600:]}")
+        try:
+            os.remove(avatar_normalized)
+        except Exception:
+            pass
+        return None
+
+    fitted_dur = _probe_media_duration(content_fitted)
+    logging.info(
+        f"   {tag}: content fit ({fit_mode}) | "
+        f"in={content_dur:.3f}s → out={fitted_dur:.3f}s (target={avatar_dur:.3f}s)"
+    )
+
+    # ────────────────────────────────────────────────────────────────────
+    # PASS 2 — visual composite (content_fitted + avatar video), no audio
+    # ────────────────────────────────────────────────────────────────────
+    av_x, av_y = layout_geom["av_x"], layout_geom["av_y"]
+    av_w, av_h = layout_geom["av_w"], layout_geom["av_h"]
+    ct_x, ct_y = layout_geom["ct_x"], layout_geom["ct_y"]
+    ct_w, ct_h = layout_geom["ct_w"], layout_geom["ct_h"]
+
+    bg_type  = layout_geom["bg_type"]
+    bg_color = layout_geom["bg_color"]
+    bg_media = None
+    temp_bg  = None
+
+    if bg_type == "image":
+        temp_bg  = _fetch_bg_media(layout_geom["bg_url"], ".jpg", chunk_folder)
+        bg_media = temp_bg
+    elif bg_type == "bgvideo":
+        temp_bg  = _fetch_bg_media(layout_geom["bg_url"], ".mp4", chunk_folder)
+        bg_media = temp_bg
+
+    parts   = []
+    current = "base"
+
+    if bg_type == "color":
+        parts.append(
+            f"color=c=#{bg_color}:s={canvas_w}x{canvas_h}:r=30:d={avatar_dur:.4f},"
+            f"format=yuv420p[base]"
+        )
+    elif bg_type == "blurred":
+        parts.append(
+            f"[0:v]scale={canvas_w//8}:{canvas_h//8}:flags=bilinear,"
+            f"scale={canvas_w}:{canvas_h}:flags=bilinear,"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "image" and bg_media:
+        parts.append(
+            f"[1:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "bgvideo" and bg_media:
+        parts.append(
+            f"[1:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"trim=duration={avatar_dur:.4f},setsar=1,format=yuv420p[base]"
+        )
+    else:
+        parts.append(
+            f"color=c=#0a0a0a:s={canvas_w}x{canvas_h}:r=30:d={avatar_dur:.4f},"
+            f"format=yuv420p[base]"
+        )
+
+    # ── Input plan (no -stream_loop anywhere in this call) ─────────────────
+    inputs   = ["-i", content_fitted]
+    next_idx = 1
+
+    if bg_type in ("image", "bgvideo") and bg_media:
+        if bg_type == "bgvideo":
+            inputs += ["-stream_loop", "-1"]
+        inputs += ["-i", bg_media]
+        next_idx += 1
+
+    inputs += ["-i", avatar_normalized]
+    avatar_idx = next_idx
+    next_idx += 1
+
+    fx = _thc_fx(layout_geom, canvas_w, canvas_h, "narration", chunk_folder, _thc_count_inputs(inputs))
+    if fx:
+        current = fx.after_base(parts, current)
+
+    if layout_geom["content_layer"]:
+        parts.append(
+            _ffmpeg_content_box_filter(
+                "0:v", "ct", ct_w, ct_h, layout_geom.get("content_fit", "cover")
+            )
+        )
+        ct_label = fx.mask_layer(parts, "content", "ct") if fx else "ct"
+        parts.append(
+            f"[{current}][{ct_label}]overlay=x={ct_x}:y={ct_y}:format=yuv420[after_ct]"
+        )
+        current = "after_ct"
+        if not fx and layout_geom["ct_border_w"] > 0:
+            db = _drawbox(
+                ct_x, ct_y, ct_w, ct_h,
+                layout_geom["ct_border_w"],
+                layout_geom["ct_border_color"],
+                layout_geom["ct_border_radius"],
+            )
+            parts.append(f"[{current}]{db}[after_ct_border]")
+            current = "after_ct_border"
+
+    parts.append(
+        _ffmpeg_avatar_box_filter(f"{avatar_idx}:v", "av", av_w, av_h)
+    )
+    av_label = fx.mask_layer(parts, "avatar", "av") if fx else "av"
+    parts.append(
+        f"[{current}][{av_label}]overlay=x={av_x}:y={av_y}:format=yuv420[after_av]"
+    )
+    current = "after_av"
+    if not fx and layout_geom["av_border_w"] > 0:
+        db = _drawbox(
+            av_x, av_y, av_w, av_h,
+            layout_geom["av_border_w"],
+            layout_geom["av_border_color"],
+            layout_geom["av_border_radius"],
+        )
+        parts.append(f"[{current}]{db}[after_av_border]")
+        current = "after_av_border"
+
+    if fx:
+        current = fx.finish(parts, current)
+        inputs += fx.input_args()
+
+    filter_complex = ";".join(parts)
+    final_label    = current
+
+    visual_path = os.path.join(chunk_folder, f"visual_{tag}_{ts}.mp4")
+
+    cmd_visual = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{final_label}]",
+        "-an",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "constqp",
+        "-qp", "18",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        visual_path,
+    ]
+
+    r_visual = subprocess.run(cmd_visual, capture_output=True, text=True)
+
+    if temp_bg and os.path.exists(temp_bg):
+        try:
+            os.remove(temp_bg)
+        except Exception:
+            pass
+    try:
+        os.remove(content_fitted)
+    except Exception:
+        pass
+
+    if r_visual.returncode != 0 or not os.path.exists(visual_path):
+        logging.error(f"❌ Batch block {tag}: visual composite failed:\n{r_visual.stderr[-800:]}")
+        try:
+            os.remove(avatar_normalized)
+        except Exception:
+            pass
+        return None
+
+    # ────────────────────────────────────────────────────────────────────
+    # PASS 3 — mux avatar's normalized audio in, stream copy, no re-encode
+    # ────────────────────────────────────────────────────────────────────
+    output_path = os.path.join(chunk_folder, f"batchblock_{tag}_{ts}.mp4")
+
+    cmd_mux = [
+        "ffmpeg", "-y",
+        "-i", visual_path,
+        "-i", avatar_normalized,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    r_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+
+    try:
+        os.remove(visual_path)
+    except Exception:
+        pass
+    try:
+        os.remove(avatar_normalized)
+    except Exception:
+        pass
+
+    if r_mux.returncode != 0 or not os.path.exists(output_path):
+        logging.error(f"❌ Batch block {tag}: audio mux failed:\n{r_mux.stderr[-800:]}")
+        return None
+
+    out_dur = _probe_media_duration(output_path)
+    logging.info(
+        f"✅ Batch block {tag} | content_in={content_dur:.3f}s "
+        f"avatar={avatar_dur:.3f}s out={out_dur:.3f}s | "
+        f"mode={fit_mode} | audio=avatar (copy, untouched) | "
+        f"zoom2-style: avoid_negative_ts make_zero + no setpts"
+    )
+    return output_path
+  
+# ── FUNCTION 1: clip layout composite (A/V locked) ─────────────────────
+def _composite_clip_with_layout(
+    clip_chunk,
+    layout_geom,
+    canvas_w,
+    canvas_h,
+    chunk_folder,
+    tag,
+):
+    """
+    CLIP segment composite — uses clip_layer from layout_config (position +
+    size on canvas). Falls back to centered content_layer box when clip_layer
+    is omitted (legacy).
+
+    Two-pass (matches batch composite — avoids nvenc filter reinit on long clips):
+      1) Fit/trim clip video into the layout box.
+      2) Composite fitted clip onto background canvas.
+      3) Mux clip audio (stream copy) when present.
+    """
+    layout_id = layout_geom["layout_id"]
+    if layout_id == "full_content":
+        return clip_chunk
+    has_audio = _clip_has_audio(clip_chunk)
+    if has_audio:
+        clip_dur = _probe_audio_duration(clip_chunk)
+    else:
+        clip_dur = _probe_stream_duration(clip_chunk, "video") or _probe_media_duration(clip_chunk)
+    if clip_dur <= 0:
+        logging.error(f"❌ Clip composite {tag}: clip has no duration")
+        return None
+    dur_s = f"{clip_dur:.4f}"
+    vtrim = f"trim=duration={dur_s},setpts=PTS-STARTPTS"
+    cl_w = layout_geom["cl_w"]
+    cl_h = layout_geom["cl_h"]
+    cl_x = layout_geom["cl_x"]
+    cl_y = layout_geom["cl_y"]
+    if (layout_id == "full_avatar" and not _thc_v2_config(layout_geom)) or cl_w <= 0 or cl_h <= 0:
+        cl_w, cl_h = canvas_w, canvas_h
+        cl_x, cl_y = 0, 0
+    bg_type  = layout_geom["bg_type"]
+    bg_color = layout_geom["bg_color"]
+    pad_color = f"0x{bg_color}" if bg_type == "color" else "black"
+    clip_fit = layout_geom.get("clip_fit", "contain")
+    ts = int(time.time() * 1000)
+
+    # ── PASS 1 — fit clip into layout box (isolated; no shared filtergraph) ──
+    clip_fitted = os.path.join(chunk_folder, f"clipfit_{tag}_{ts}.mp4")
+    fit_inner = _ffmpeg_content_box_filter("vin", "vout", cl_w, cl_h, clip_fit, pad_color)
+    fit_fc = f"[0:v]{vtrim}[vin];{fit_inner}"
+    cmd_fit = [
+        "ffmpeg", "-y",
+        "-i", clip_chunk,
+        "-filter_complex", fit_fc,
+        "-map", "[vout]",
+        "-an",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "constqp",
+        "-qp", "18",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        "-t", dur_s,
+        clip_fitted,
+    ]
+    r_fit = subprocess.run(cmd_fit, capture_output=True, text=True)
+    if r_fit.returncode != 0 or not os.path.exists(clip_fitted):
+        logging.error(f"❌ Clip composite {tag} pass-1 (fit) failed:\n{r_fit.stderr[-800:]}")
+        return None
+
+    fitted_dur = _probe_stream_duration(clip_fitted, "video") or clip_dur
+    dur_s = f"{fitted_dur:.4f}"
+
+    # ── PASS 2 — background + overlay fitted clip (video only) ──
+    bg_media = None
+    temp_bg  = None
+    if bg_type == "image":
+        temp_bg  = _fetch_bg_media(layout_geom["bg_url"], ".jpg", chunk_folder)
+        bg_media = temp_bg
+    elif bg_type == "bgvideo":
+        temp_bg  = _fetch_bg_media(layout_geom["bg_url"], ".mp4", chunk_folder)
+        bg_media = temp_bg
+
+    parts   = []
+    current = "base"
+    if bg_type == "color":
+        parts.append(
+            f"color=c=0x{bg_color}:s={canvas_w}x{canvas_h}:r=30:d={dur_s},"
+            f"format=yuv420p[base]"
+        )
+    elif bg_type == "blurred":
+        parts.append(
+            f"[0:v]split=2[blur_in][fg_in];"
+            f"[blur_in]scale={canvas_w//8}:{canvas_h//8}:flags=bilinear,"
+            f"scale={canvas_w}:{canvas_h}:flags=bilinear,"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "image" and bg_media:
+        parts.append(
+            f"[1:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "bgvideo" and bg_media:
+        parts.append(
+            f"[1:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"trim=duration={dur_s},setsar=1,format=yuv420p[base]"
+        )
+    else:
+        parts.append(
+            f"color=c=0x0a0a0a:s={canvas_w}x{canvas_h}:r=30:d={dur_s},"
+            f"format=yuv420p[base]"
+        )
+
+    inputs = ["-i", clip_fitted]
+    if bg_type in ("image", "bgvideo") and bg_media:
+        if bg_type == "bgvideo":
+            inputs += ["-stream_loop", "-1"]
+        inputs += ["-i", bg_media]
+
+    fx = _thc_fx(layout_geom, canvas_w, canvas_h, "clip", chunk_folder, _thc_count_inputs(inputs))
+    if fx:
+        current = fx.after_base(parts, current)
+    clip_src = "fg_in" if bg_type == "blurred" else "0:v"
+    clip_label = fx.mask_layer(parts, "clip", clip_src) if fx else clip_src
+    parts.append(
+        f"[{current}][{clip_label}]overlay=x={cl_x}:y={cl_y}:format=auto[after_ct]"
+    )
+    current = "after_ct"
+
+    clip_border_w = layout_geom.get("cl_border_w", layout_geom["ct_border_w"])
+    clip_border_color = layout_geom.get("cl_border_color", layout_geom["ct_border_color"])
+    clip_border_radius = layout_geom.get("cl_border_radius", layout_geom["ct_border_radius"])
+    if not fx and clip_border_w > 0:
+        db = _drawbox(
+            cl_x, cl_y, cl_w, cl_h,
+            clip_border_w,
+            clip_border_color,
+            clip_border_radius,
+        )
+        parts.append(f"[{current}]{db}[after_ct_border]")
+        current = "after_ct_border"
+
+    if fx:
+        current = fx.finish(parts, current)
+        inputs += fx.input_args()
+
+    filter_complex = ";".join(parts)
+    visual_path = os.path.join(chunk_folder, f"clipvis_{tag}_{ts}.mp4")
+    cmd_visual = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{current}]",
+        "-an",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "constqp",
+        "-qp", "18",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        visual_path,
+    ]
+    r_visual = subprocess.run(cmd_visual, capture_output=True, text=True)
+    try:
+        os.remove(clip_fitted)
+    except Exception:
+        pass
+    if temp_bg and os.path.exists(temp_bg):
+        try:
+            os.remove(temp_bg)
+        except Exception:
+            pass
+    if r_visual.returncode != 0 or not os.path.exists(visual_path):
+        logging.error(f"❌ Clip composite {tag} pass-2 (visual) failed:\n{r_visual.stderr[-800:]}")
+        return None
+
+    output_path = os.path.join(chunk_folder, f"clipcomposited_{tag}_{ts}.mp4")
+    if not has_audio:
+        try:
+            os.rename(visual_path, output_path)
+        except Exception:
+            shutil.copy2(visual_path, output_path)
+            os.remove(visual_path)
+    else:
+        cmd_mux = [
+            "ffmpeg", "-y",
+            "-i", visual_path,
+            "-i", clip_chunk,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-t", dur_s,
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        r_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+        try:
+            os.remove(visual_path)
+        except Exception:
+            pass
+        if r_mux.returncode != 0 or not os.path.exists(output_path):
+            logging.error(f"❌ Clip composite {tag} pass-3 (mux) failed:\n{r_mux.stderr[-800:]}")
+            return None
+
+    out_dur = _probe_audio_duration(output_path) if has_audio else _probe_stream_duration(output_path, "video")
+    logging.info(
+        f"✅ Clip composite {tag} | in={clip_dur:.3f}s out={out_dur:.3f}s | "
+        f"at ({cl_x},{cl_y}) {cl_w}x{cl_h} | "
+        f"A/V locked ({'audio master' if has_audio else 'video only'})"
+    )
+    return output_path
+
+def _apply_batch_avatar_composite(
+    chunk_paths,
+    avatar_segment_map,
+    vid_segments,
+    layout_config,
+    canvas_w,
+    canvas_h,
+    chunk_folder,
+):
+    """
+    CLIP VIDEOS ONLY — batch-level composite BEFORE final concat.
+
+    Replaces each group of narration segment chunks (one avatar batch's
+    worth) with a single composited block: avatar plays naturally,
+    content trimmed/looped to match, avatar's own audio is final audio.
+
+    Clip segments get the same layout treatment (background, border,
+    content-box size) as narration blocks, but CENTERED on canvas since
+    there's no avatar to share space with. Original audio + duration
+    preserved.
+    """
+    layout_id = layout_config.get("layout_id", "")
+    if layout_id == "full_content":
+        logging.info("full_content — skipping batch avatar composite")
+        return chunk_paths
+
+    if not avatar_segment_map:
+        logging.error("❌ avatar_segment_map is empty")
+        return chunk_paths
+
+    layout_geom = _extract_layout_geometry(layout_config, canvas_w, canvas_h)
+    groups      = _group_batches_from_map(avatar_segment_map)
+
+    logging.info(
+        f"🎭 Batch composite (clip video) | layout={layout_id} | "
+        f"batches={len(groups)} | segments={len(vid_segments)}"
+    )
+
+    # Build a lookup: seg_idx → batch_index (for narration segments)
+    seg_to_batch = {}
+    for bidx, g in groups.items():
+        for seg_idx in g["seg_indices"]:
+            seg_to_batch[seg_idx] = bidx
+
+    new_paths = []
+    i = 0
+    n = len(vid_segments)
+    batch_count = 0
+    clip_count  = 0
+    fail_count  = 0
+
+    while i < n:
+        seg = vid_segments[i]
+        chunk = chunk_paths[i] if i < len(chunk_paths) else None
+
+        if not chunk or not os.path.exists(chunk):
+            logging.error(f"❌ Segment {i}: missing chunk, skipping")
+            new_paths.append(chunk)
+            fail_count += 1
+            i += 1
+            continue
+
+        if _is_clip_segment(seg):
+            # Same layout treatment as narration blocks (background,
+            # border, content-box size) but CENTERED — no avatar to
+            # share space with. Original audio + duration preserved.
+            clip_count += 1
+            composited_clip = _composite_clip_with_layout(
+                clip_chunk   = chunk,
+                layout_geom  = layout_geom,
+                canvas_w     = canvas_w,
+                canvas_h     = canvas_h,
+                chunk_folder = chunk_folder,
+                tag          = f"seg{i}",
+            )
+            if composited_clip:
+                logging.info(f"🎬 Segment {i}: CLIP — centered layout composite")
+                new_paths.append(composited_clip)
+            else:
+                logging.warning(f"⚠️ Segment {i}: CLIP composite failed — keeping raw chunk")
+                new_paths.append(chunk)
+            i += 1
+            continue
+
+        bidx = seg_to_batch.get(i)
+        if bidx is None:
+            logging.warning(f"⚠️ Segment {i}: narration but no batch mapping — keeping raw chunk")
+            new_paths.append(chunk)
+            i += 1
+            continue
+
+        group       = groups[bidx]
+        seg_indices = group["seg_indices"]
+
+        if seg_indices[0] != i:
+            # Shouldn't happen if groups are contiguous and we walk in order,
+            # but guard against malformed maps.
+            logging.warning(
+                f"⚠️ Segment {i}: batch {bidx} group starts at {seg_indices[0]}, "
+                f"not {i} — keeping raw chunk"
+            )
+            new_paths.append(chunk)
+            i += 1
+            continue
+
+        if layout_id == "full_avatar":
+            composited = _composite_full_avatar_batch_block(
+                avatar_batch_path=group["path"],
+                layout_geom=layout_geom,
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                chunk_folder=chunk_folder,
+                tag=f"b{bidx}",
+            )
+            if composited:
+                new_paths.append(composited)
+                batch_count += 1
+            else:
+                logging.warning(
+                    f"⚠️ Batch {bidx}: full_avatar composite failed — keeping raw chunks"
+                )
+                for seg_idx in seg_indices:
+                    if seg_idx < len(chunk_paths):
+                        new_paths.append(chunk_paths[seg_idx])
+                        fail_count += 1
+            i += len(seg_indices)
+            continue
+
+        # Collect this batch's segment chunks (must be contiguous run i..i+len-1)
+        block_chunks = []
+        ok = True
+        for offset, seg_idx in enumerate(seg_indices):
+            expected = i + offset
+            if seg_idx != expected:
+                logging.warning(
+                    f"⚠️ Batch {bidx}: non-contiguous seg_indices {seg_indices} "
+                    f"at offset {offset} (expected {expected}) — keeping raw chunks"
+                )
+                ok = False
+                break
+            c = chunk_paths[seg_idx] if seg_idx < len(chunk_paths) else None
+            if not c or not os.path.exists(c):
+                logging.error(f"❌ Batch {bidx}: segment {seg_idx} chunk missing")
+                ok = False
+                break
+            block_chunks.append(c)
+
+        if not ok or not block_chunks:
+            for seg_idx in seg_indices:
+                if seg_idx < len(chunk_paths):
+                    new_paths.append(chunk_paths[seg_idx])
+                    fail_count += 1
+            i += len(seg_indices)
+            continue
+
+        content_block = _concat_chunks(block_chunks, chunk_folder, tag=f"b{bidx}")
+        if not content_block:
+            logging.error(f"❌ Batch {bidx}: content block concat failed — keeping raw chunks")
+            new_paths.extend(block_chunks)
+            fail_count += 1
+            i += len(seg_indices)
+            continue
+
+        composited = _composite_batch_block(
+            content_block     = content_block,
+            avatar_batch_path = group["path"],
+            layout_geom       = layout_geom,
+            canvas_w          = canvas_w,
+            canvas_h          = canvas_h,
+            chunk_folder      = chunk_folder,
+            tag               = f"b{bidx}",
+        )
+
+        if content_block not in block_chunks and os.path.exists(content_block):
+            try:
+                os.remove(content_block)
+            except Exception:
+                pass
+
+        if composited:
+            new_paths.append(composited)
+            batch_count += 1
+        else:
+            logging.warning(f"⚠️ Batch {bidx}: composite failed — keeping raw chunks")
+            new_paths.extend(block_chunks)
+            fail_count += 1
+
+        i += len(seg_indices)
+
+    logging.info("")
+    logging.info("=" * 55)
+    logging.info("🎭 BATCH COMPOSITE SUMMARY (CLIP VIDEO)")
+    logging.info(f"   batches composited : {batch_count}")
+    logging.info(f"   clips (centered)   : {clip_count}")
+    logging.info(f"   failures           : {fail_count}")
+    logging.info("=" * 55)
+
+    return new_paths
+
+# ════════════════════════════════════════════════════════════════════════
+# NO-CLIP VIDEOS
+# ════════════════════════════════════════════════════════════════════════
+
+def _concat_avatar_batches(avatar_segment_map, chunk_folder):
+    """
+    Stream-copy concat of avatar batches — mirrors zoom2's concat_avatars.
+    """
+    batches = {}
+    for _, info in avatar_segment_map.items():
+        b = info["batch_index"]
+        if b not in batches:
+            batches[b] = info["path"]
+
+    ordered_paths = [batches[b] for b in sorted(batches)]
+    if not ordered_paths:
+        logging.error("❌ avatar_segment_map produced no batch paths")
+        return None
+
+    avatar_track = os.path.join(
+        chunk_folder, f"avatar_track_{int(time.time() * 1000)}.mp4"
+    )
+    concat_txt = os.path.join(
+        chunk_folder, f"avatar_concat_{int(time.time() * 1000)}.txt"
+    )
+
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for p in ordered_paths:
+            f.write(f"file '{os.path.abspath(p).replace(os.sep, '/')}'\n")
+
+    logging.info(
+        f"📦 Concat {len(ordered_paths)} batch(es): "
+        f"{[os.path.basename(p) for p in ordered_paths]}"
+    )
+
+    t0 = time.time()
+    r = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_txt,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        avatar_track,
+    ], capture_output=True, text=True)
+
+    if r.returncode != 0 or not os.path.exists(avatar_track):
+        logging.error(f"❌ Avatar batch concat failed:\n{r.stderr[-800:]}")
+        return None
+
+    dur = _probe_media_duration(avatar_track)
+    mb  = os.path.getsize(avatar_track) / (1024 * 1024)
+    logging.info(
+        f"✅ Avatar track ready | {dur:.3f}s | {mb:.1f}MB | "
+        f"{time.time() - t0:.1f}s"
+    )
+    return avatar_track, concat_txt
+
+def _composite_avatar_over_full_video(
+    content_video,
+    avatar_segment_map,
+    layout_config,
+    canvas_w,
+    canvas_h,
+    chunk_folder,
+):
+    """
+    NO-CLIP VIDEOS — avatar is the master clock.
+
+    Avatar batches are concatenated into a single avatar_track. The
+    content_video is fitted to EXACTLY avatar_track's duration:
+      - content shorter than avatar → FREEZE LAST FRAME for the remainder
+      - content longer  than avatar → TRIM to avatar duration
+      - equal                       → re-encode to exact length
+
+    Visual composite uses content_fitted + avatar_track (avatar PTS
+    untouched, no setpts). Final audio is avatar_track's own audio only
+    (stream copy) — guarantees lip sync regardless of content length.
+    """
+    layout_id = layout_config.get("layout_id", "")
+    if layout_id == "full_content":
+        logging.info("full_content — skipping avatar composite")
+        return None
+
+    if not avatar_segment_map:
+        logging.error("❌ avatar_segment_map is empty")
+        return None
+
+    layout_geom_early = _extract_layout_geometry(layout_config, canvas_w, canvas_h)
+
+    if layout_id == "full_avatar":
+        logging.info(
+            "⚡ full_avatar — avatar-only export (skipped content download/composite)"
+        )
+        concat_result = _concat_avatar_batches(avatar_segment_map, chunk_folder)
+        if not concat_result:
+            return None
+        avatar_track, concat_txt = concat_result
+        avatar_normalized = _normalize_avatar_batch_input(
+            avatar_track, chunk_folder, "full"
+        )
+        for p in (avatar_track, concat_txt):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        if not avatar_normalized:
+            return None
+        out = _composite_full_avatar_from_normalized_avatar(
+            avatar_normalized,
+            canvas_w,
+            canvas_h,
+            chunk_folder,
+            "full",
+            layout_geom=layout_geom_early,
+        )
+        try:
+            os.remove(avatar_normalized)
+        except Exception:
+            pass
+        return out
+
+    layout_geom = layout_geom_early
+
+    av_x, av_y = layout_geom["av_x"], layout_geom["av_y"]
+    av_w, av_h = layout_geom["av_w"], layout_geom["av_h"]
+    ct_x, ct_y = layout_geom["ct_x"], layout_geom["ct_y"]
+    ct_w, ct_h = layout_geom["ct_w"], layout_geom["ct_h"]
+
+    content_dur = _probe_media_duration(content_video)
+
+    logging.info("🎭 mode=direct (no clips, avatar-master)")
+
+    concat_result = _concat_avatar_batches(avatar_segment_map, chunk_folder)
+    if not concat_result:
+        return None
+    avatar_track, concat_txt = concat_result
+    av_track_dur = _probe_media_duration(avatar_track)
+
+    if av_track_dur <= 0:
+        logging.error("❌ avatar_track has no duration")
+        for p in (avatar_track, concat_txt):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        return None
+
+    logging.info(
+        f"⏱️  avatar_file={av_track_dur:.3f}s | content={content_dur:.3f}s"
+    )
+
+    ts = int(time.time() * 1000)
+
+    # ────────────────────────────────────────────────────────────────────
+    # PASS 1 — fit content_video to EXACTLY av_track_dur.
+    # Avatar is master (own audio = lip sync truth). Content is capped/
+    # padded to match — never the reverse.
+    #   - content shorter than avatar → FREEZE LAST FRAME for remainder
+    #   - content longer  than avatar → TRIM to avatar duration
+    #   - equal                       → re-encode to exact length
+    # Isolated single-input call — no shared filtergraph with avatar.
+    # ────────────────────────────────────────────────────────────────────
+    content_fitted = os.path.join(chunk_folder, f"fullfit_{ts}.mp4")
+
+    if content_dur < av_track_dur - 0.01:
+        pad_dur = av_track_dur - content_dur
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-i", content_video,
+            "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.4f}",
+            "-t", f"{av_track_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "freeze_last_frame"
+    elif content_dur > av_track_dur + 0.01:
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-i", content_video,
+            "-t", f"{av_track_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "trim"
+    else:
+        cmd_fit = [
+            "ffmpeg", "-y",
+            "-i", content_video,
+            "-t", f"{av_track_dur:.4f}",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            content_fitted,
+        ]
+        fit_mode = "exact"
+
+    r_fit = subprocess.run(cmd_fit, capture_output=True, text=True)
+    if r_fit.returncode != 0 or not os.path.exists(content_fitted):
+        logging.error(f"❌ content fit ({fit_mode}) failed:\n{r_fit.stderr[-600:]}")
+        for p in (avatar_track, concat_txt):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        return None
+
+    fitted_dur = _probe_media_duration(content_fitted)
+    logging.info(
+        f"   content fit ({fit_mode}) | in={content_dur:.3f}s → "
+        f"out={fitted_dur:.3f}s (target={av_track_dur:.3f}s)"
+    )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Visual composite — content_fitted + avatar_track
+    # ────────────────────────────────────────────────────────────────────
+    bg_type  = layout_geom["bg_type"]
+    bg_color = layout_geom["bg_color"]
+    bg_media = None
+
+    if bg_type == "image":
+        bg_media = _fetch_bg_media(layout_geom["bg_url"], ".jpg", chunk_folder)
+    elif bg_type == "bgvideo":
+        bg_media = _fetch_bg_media(layout_geom["bg_url"], ".mp4", chunk_folder)
+
+    logging.info(f"🎨 BG type={bg_type}")
+
+    # input 0 : content_fitted (video only, duration == avatar duration)
+    # input 1 : avatar track (always)
+    # input 2+: optional bg media (image/bgvideo only)
+    bg_input_idx = 2
+    parts        = []
+    current      = "base"
+
+    if bg_type == "blurred":
+        parts.append(
+            f"[0:v]scale={canvas_w//8}:{canvas_h//8}:flags=bilinear,"
+            f"scale={canvas_w}:{canvas_h}:flags=bilinear,"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "color":
+        parts.append(
+            f"color=c=#{bg_color}:s={canvas_w}x{canvas_h}:r=30:d={av_track_dur:.4f},"
+            f"format=yuv420p[base]"
+        )
+    elif bg_type == "image" and bg_media:
+        parts.append(
+            f"[{bg_input_idx}:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif bg_type == "bgvideo" and bg_media:
+        parts.append(
+            f"[{bg_input_idx}:v]{_thc_bg_scale(layout_geom, canvas_w, canvas_h)},"
+            f"trim=duration={av_track_dur:.4f},"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    else:
+        parts.append(
+            f"color=c=#0a0a0a:s={canvas_w}x{canvas_h}:r=30:d={av_track_dur:.4f},"
+            f"format=yuv420p[base]"
+        )
+
+    # Designed canvas (style_version 2) — stills appended after the bg input
+    fx = _thc_fx(
+        layout_geom, canvas_w, canvas_h, "narration", chunk_folder,
+        2 + (1 if bg_type in ("image", "bgvideo") and bg_media else 0),
+    )
+    if fx:
+        current = fx.after_base(parts, current)
+
+    # Content layer
+    if layout_geom["content_layer"] and layout_id != "full_avatar":
+        parts.append(
+            _ffmpeg_content_box_filter(
+                "0:v", "ct", ct_w, ct_h, layout_geom.get("content_fit", "cover")
+            )
+        )
+        ct_label = fx.mask_layer(parts, "content", "ct") if fx else "ct"
+        parts.append(
+            f"[{current}][{ct_label}]overlay=x={ct_x}:y={ct_y}:format=yuv420[after_ct]"
+        )
+        current = "after_ct"
+        if not fx and layout_geom["ct_border_w"] > 0:
+            db = _drawbox(
+                ct_x, ct_y, ct_w, ct_h,
+                layout_geom["ct_border_w"],
+                layout_geom["ct_border_color"],
+                layout_geom["ct_border_radius"],
+            )
+            parts.append(f"[{current}]{db}[after_ct_border]")
+            current = "after_ct_border"
+
+    # Avatar overlay — NO setpts, PTS passed through as-is
+    sw, sh, ox, oy = av_w, av_h, av_x, av_y
+    parts.append(
+        _ffmpeg_avatar_box_filter("1:v", "av", sw, sh)
+    )
+    av_label = fx.mask_layer(parts, "avatar", "av") if fx else "av"
+    parts.append(
+        f"[{current}][{av_label}]overlay=x={ox}:y={oy}:format=yuv420[after_av]"
+    )
+    current = "after_av"
+
+    if not fx and layout_geom["av_border_w"] > 0 and layout_id not in ("full_content",):
+        db = _drawbox(
+            av_x, av_y, av_w, av_h,
+            layout_geom["av_border_w"],
+            layout_geom["av_border_color"],
+            layout_geom["av_border_radius"],
+        )
+        parts.append(f"[{current}]{db}[after_av_border]")
+        current = "after_av_border"
+
+    if fx:
+        current = fx.finish(parts, current)
+
+    filter_complex = ";".join(parts)
+    final_label    = current
+
+    logging.info(
+        f"🔧 filter_complex ({len(filter_complex)} chars):\n{filter_complex}"
+    )
+
+    # ── inputs — 0 = content_fitted, 1 = avatar_track ──────────────────────
+    inputs = [
+        "-hwaccel", "cuda", "-i", content_fitted,
+        "-hwaccel", "cuda", "-i", avatar_track,
+    ]
+    if bg_type in ("image", "bgvideo") and bg_media:
+        if bg_type == "bgvideo":
+            inputs += ["-stream_loop", "-1"]
+        inputs += ["-hwaccel", "cuda", "-i", bg_media]
+    if fx:
+        inputs += fx.input_args()
+
+    visual_path = os.path.join(chunk_folder, f"composited_visual_{ts}.mp4")
+
+    cmd_visual = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map",       f"[{final_label}]",
+        "-an",
+        "-c:v",       "h264_nvenc",
+        "-preset",    "p4",
+        "-rc",        "constqp",
+        "-qp",        "18",
+        "-profile:v", "high",
+        "-pix_fmt",   "yuv420p",
+        visual_path,
+    ]
+
+    logging.info("🚀 NVENC visual composite (avatar-master, no audio)…")
+    t0      = time.time()
+    result  = subprocess.run(cmd_visual, capture_output=True, text=True)
+    elapsed = time.time() - t0
+
+    try:
+        os.remove(content_fitted)
+    except Exception:
+        pass
+    if bg_media and os.path.exists(bg_media):
+        try:
+            os.remove(bg_media)
+        except Exception:
+            pass
+
+    if result.returncode != 0 or not os.path.exists(visual_path):
+        logging.error(
+            f"❌ Visual composite failed ({elapsed:.1f}s):\n{result.stderr[-1500:]}"
+        )
+        for p in (avatar_track, concat_txt):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        return None
+
+    # ────────────────────────────────────────────────────────────────────
+    # PASS 2 — mux avatar_track's own audio in, stream copy, no re-encode.
+    # Avatar's audio is the ONLY audio → guaranteed lip sync.
+    # ────────────────────────────────────────────────────────────────────
+    output_path = os.path.join(chunk_folder, f"composited_{int(time.time())}.mp4")
+
+    cmd_mux = [
+        "ffmpeg", "-y",
+        "-i", visual_path,
+        "-i", avatar_track,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    r_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+
+    for p in (visual_path, avatar_track, concat_txt):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    if r_mux.returncode != 0 or not os.path.exists(output_path):
+        logging.error(f"❌ Audio mux failed:\n{r_mux.stderr[-800:]}")
+        return None
+
+    out_dur = _probe_media_duration(output_path)
+    mb      = os.path.getsize(output_path) / (1024 * 1024)
+
+    logging.info("")
+    logging.info("=" * 55)
+    logging.info("🎉 COMPOSITE DONE (AVATAR-MASTER)")
+    logging.info(f"   output  : {output_path}")
+    logging.info(f"   size    : {mb:.1f} MB")
+    logging.info(f"   time    : {elapsed:.1f}s")
+    logging.info(f"   content : {content_dur:.3f}s (fitted: {fitted_dur:.3f}s, mode={fit_mode})")
+    logging.info(f"   avatar  : {av_track_dur:.3f}s")
+    logging.info(f"   output  : {out_dur:.3f}s")
+    logging.info(f"   audio   : avatar (copy, untouched) — lip sync guaranteed")
+    logging.info("=" * 55)
+
+    return output_path
+
+
+def _normalize_audio_only(chunk_path, chunk_folder, tag, apply_loudnorm=False):
+    """
+    Re-encode audio to 44100Hz/stereo/aac, stream-copy video.
+
+    When apply_loudnorm is True, also run EBU R128 loudnorm so DreamFace
+    avatar narration and hot clip-source audio land at the same level.
+    """
+    if not chunk_path or not os.path.exists(chunk_path):
+        return None
+    out_path = os.path.join(chunk_folder, f"normaud_{tag}_{int(time.time()*1000)}.mp4")
+    has_audio = _clip_has_audio(chunk_path)
+    cmd = ["ffmpeg", "-y", "-i", chunk_path, "-c:v", "copy"]
+    if has_audio:
+        if apply_loudnorm:
+            cmd += [
+                "-af",
+                (
+                    f"loudnorm=I={PIPELINE_AUDIO_TARGET_LUFS}:TP=-1.5:LRA=11"
+                ),
+            ]
+        cmd += [
+            "-ar", "44100", "-ac", "2",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+        ]
+    cmd += ["-movflags", "+faststart", out_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out_path):
+        logging.error(f"❌ Audio normalize failed ({tag}):\n{r.stderr[-600:]}")
+        return None
+    return out_path
+
+def _prepare_chunk_for_concat(src, dst, loudness_normalize=False):
+    """
+    Remux chunk to PTS=0 + uniform audio before final concat.
+    Prevents 40-min timeline inflation and A/V drift at segment joins.
+
+    When loudness_normalize is True (talking-heads + clip videos), each chunk
+    is brought to PIPELINE_AUDIO_TARGET_LUFS so avatar commentary and clip
+    audio feel consistent at segment transitions.
+    """
+    if not src or not os.path.exists(src):
+        return None
+
+    has_audio = _clip_has_audio(src)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-map", "0:v:0",
+    ]
+    if has_audio:
+        cmd += ["-map", "0:a:0"]
+    cmd += ["-c:v", "copy"]
+    if has_audio:
+        if loudness_normalize:
+            cmd += [
+                "-af",
+                (
+                    f"loudnorm=I={PIPELINE_AUDIO_TARGET_LUFS}:TP=-1.5:LRA=11"
+                ),
+            ]
+        cmd += [
+            "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        ]
+    cmd += [
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts",
+        "-movflags", "+faststart",
+        dst,
+    ]
+    label = (
+        f"chunk-prep+loudnorm {os.path.basename(src)}"
+        if loudness_normalize and has_audio
+        else f"chunk-prep {os.path.basename(src)}"
+    )
+    r = _ffmpeg_run(
+        cmd,
+        timeout=FFMPEG_CHUNK_PREP_TIMEOUT,
+        label=label,
+    )
+    if loudness_normalize and has_audio and (
+        not r or r.returncode != 0 or not os.path.exists(dst)
+    ):
+        logging.warning(
+            f"⚠️ Loudnorm prep failed for {os.path.basename(src)} — "
+            "falling back to format-only prep"
+        )
+        return _prepare_chunk_for_concat(src, dst, loudness_normalize=False)
+
+    if not r or r.returncode != 0 or not os.path.exists(dst):
+        if r:
+            logging.error(f"❌ Chunk prep failed:\n{r.stderr[-800:]}")
+        return None
+    return dst
+
+
+def _loudnorm_measure(src):
+    """Pass 1 of EBU R128 loudnorm — returns the measured values (or None)."""
+    r = _ffmpeg_run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats", "-i", src, "-map", "0:a:0",
+            "-af", f"loudnorm=I={PIPELINE_AUDIO_TARGET_LUFS}:TP=-1.5:LRA=11:print_format=json",
+            "-f", "null", "-",
+        ],
+        timeout=max(FFMPEG_CHUNK_PREP_TIMEOUT, 600),
+        label=f"loudnorm measure {os.path.basename(src)}",
+    )
+    if not r or r.returncode != 0:
+        return None
+    txt = r.stderr or ""
+    i = txt.rfind("{")
+    j = txt.rfind("}")
+    if i < 0 or j < i:
+        return None
+    try:
+        return json.loads(txt[i:j + 1])
+    except Exception:
+        return None
+
+
+def _loudness_match_chunk(src, dst):
+    """
+    Two-pass loudnorm (linear = one steady gain, no pumping) on ONE chunk.
+    Silent / muted chunks are left untouched. Never accepted if any audio
+    would be lost: the result must be at least as long as the source audio.
+    """
+    from helper.banner_backend import _decoded_audio_seconds
+
+    if not src or not os.path.exists(src) or not _clip_has_audio(src):
+        return src
+    m = _loudnorm_measure(src)
+    try:
+        measured_i = float(m["input_i"]) if m else float("-inf")
+    except (TypeError, ValueError, KeyError):
+        measured_i = float("-inf")
+    if not m or not (measured_i > -60.0):
+        return src
+    af = (
+        f"loudnorm=I={PIPELINE_AUDIO_TARGET_LUFS}:TP=-1.5:LRA=11:"
+        f"measured_I={m['input_i']}:measured_TP={m['input_tp']}:"
+        f"measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}:"
+        f"offset={m['target_offset']}:linear=true,aresample=48000"
+    )
+    r = _ffmpeg_run(
+        [
+            "ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-af", af,
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+            "-movflags", "+faststart", dst,
+        ],
+        timeout=max(FFMPEG_CHUNK_PREP_TIMEOUT, 600),
+        label=f"loudnorm apply {os.path.basename(src)}",
+    )
+    if not r or r.returncode != 0 or not os.path.exists(dst):
+        logging.warning(f"⚠️ Loudness match failed for {os.path.basename(src)} — keeping original audio")
+        return src
+    a_in = _decoded_audio_seconds(src)
+    a_out = _decoded_audio_seconds(dst)
+    if a_out + 0.0005 < a_in:
+        logging.warning(
+            f"⚠️ Loudness match would shorten audio ({a_in:.4f}s → {a_out:.4f}s) "
+            f"for {os.path.basename(src)} — keeping original"
+        )
+        return src
+    return dst
+
+
+def _loudness_match_chunks(chunk_paths, chunk_folder):
+    """Level every chunk to PIPELINE_AUDIO_TARGET_LUFS in parallel (before banners)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    t0 = time.time()
+
+    def _one(item):
+        idx, p = item
+        if not p:
+            return p
+        dst = os.path.join(chunk_folder, f"leveled_{idx}_{int(time.time() * 1000)}.mp4")
+        return _loudness_match_chunk(p, dst)
+
+    workers = max(1, int(os.getenv("LOUDNESS_WORKERS", "6")))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        out = list(ex.map(_one, enumerate(chunk_paths)))
+    changed = sum(1 for a, b in zip(chunk_paths, out) if a != b)
+    logging.info(
+        f"🔊 Loudness matched {changed}/{len(chunk_paths)} chunk(s) to "
+        f"{PIPELINE_AUDIO_TARGET_LUFS} LUFS (two-pass, steady gain) in {time.time() - t0:.1f}s"
+    )
+    return out
+
+
+def _encode_narration_to_audio_length(
+    video_path,
+    segment_audio_path,
+    duration_needed,
+    chunk_path,
+    canvas_w,
+    canvas_h,
+    video_codec,
+    preset_val,
+    mute_source=False,
+    nvenc_semaphore=None,
+    segment_index=None,
+    ffmpeg_timeout=FFMPEG_SEGMENT_TIMEOUT,
+):
+    """
+    Narration rule: output duration == narration audio duration.
+    Video loops/trims to fit; audio is narration; PTS zeroed.
+    """
+    if mute_source:
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", video_path,
+            "-i", segment_audio_path,
+            "-filter_complex",
+            (
+                f"[0:v]trim=duration={duration_needed:.4f},"
+                f"setpts=PTS-STARTPTS,fps=30,"
+                f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,"
+                f"crop={canvas_w}:{canvas_h},format=yuv420p[v]"
+            ),
+            "-map", "[v]",
+            "-map", "1:a:0",
+            "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-r", "30", "-vsync", "cfr",
+            "-shortest",
+            "-avoid_negative_ts", "make_zero",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            chunk_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", segment_audio_path,
+            "-filter_complex",
+            (
+                f"[0:v]trim=duration={duration_needed:.4f},"
+                f"setpts=PTS-STARTPTS,fps=30,"
+                f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,"
+                f"crop={canvas_w}:{canvas_h},format=yuv420p[v]"
+            ),
+            "-map", "[v]",
+            "-map", "1:a:0",
+            "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-r", "30", "-vsync", "cfr",
+            "-shortest",
+            "-avoid_negative_ts", "make_zero",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            chunk_path,
+        ]
+
+    label = (
+        f"seg {segment_index} narration-mux"
+        if segment_index is not None
+        else "narration-mux"
+    )
+    uses_nvenc = "nvenc" in (video_codec or "")
+    r = _ffmpeg_run(
+        cmd,
+        timeout=ffmpeg_timeout,
+        label=label,
+        nvenc_semaphore=nvenc_semaphore,
+        uses_nvenc=uses_nvenc,
+    )
+    if not r or r.returncode != 0:
+        if r:
+            logging.error(f"❌ Narration encode failed:\n{r.stderr[-800:]}")
+        return None
+    return chunk_path
+
+
+def _encode_clip_segment(
+    src,
+    chunk_path,
+    canvas_w,
+    canvas_h,
+    video_codec,
+    preset_val,
+    mute=False,
+    nvenc_semaphore=None,
+    segment_index=None,
+    ffmpeg_timeout=FFMPEG_SEGMENT_TIMEOUT,
+):
+    """
+    CLIP rule: play external clip out fully; A/V stay together.
+    """
+    encode_src = src
+    repaired_path = None
+
+    def _run_encode(source_path):
+        clip_dur = _probe_stream_duration(source_path, "video") or _probe_media_duration(
+            source_path
+        )
+        if clip_dur <= 0:
+            logging.error(
+                "❌ CLIP segment: no duration | seg=%s | src=%s",
+                segment_index,
+                source_path,
+            )
+            return None, 0.0, False
+
+        has_audio = _clip_has_audio(source_path) and not mute
+
+        vf = (
+            f"fps=30,setpts=PTS-STARTPTS,"
+            f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,"
+            f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", source_path,
+            "-vf", vf,
+            "-t", f"{clip_dur:.4f}",
+            "-r", "30", "-vsync", "cfr",
+            "-c:v", video_codec, "-preset", preset_val, *_segment_rate_args(video_codec),
+            "-pix_fmt", "yuv420p",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            chunk_path,
+        ]
+
+        if has_audio:
+            cmd += [
+                "-map", "0:v:0", "-map", "0:a:0",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+            ]
+        else:
+            cmd += ["-map", "0:v:0", "-an"]
+
+        label = (
+            f"seg {segment_index} clip-encode"
+            if segment_index is not None
+            else "clip-encode"
+        )
+        uses_nvenc = "nvenc" in (video_codec or "")
+        r = _ffmpeg_run(
+            cmd,
+            timeout=ffmpeg_timeout,
+            label=label,
+            nvenc_semaphore=nvenc_semaphore,
+            uses_nvenc=uses_nvenc,
+        )
+        if not r or r.returncode != 0:
+            if r:
+                logging.error(
+                    "❌ CLIP encode failed | seg=%s | src=%s\n%s",
+                    segment_index,
+                    source_path,
+                    r.stderr[-800:],
+                )
+            return None, clip_dur, has_audio
+        return r, clip_dur, has_audio
+
+    logging.info(
+        "🎬 CLIP encode | seg=%s | src=%s",
+        segment_index,
+        os.path.basename(src),
+    )
+
+    r, clip_dur, has_audio = _run_encode(encode_src)
+    if r is None:
+        repaired_path = os.path.join(
+            os.path.dirname(chunk_path),
+            f"clip_repair_{segment_index}_{uuid.uuid4().hex[:8]}.mp4",
+        )
+        if _repair_clip_source_for_encode(src, repaired_path):
+            encode_src = repaired_path
+            r, clip_dur, has_audio = _run_encode(encode_src)
+
+    if repaired_path and os.path.exists(repaired_path):
+        try:
+            os.remove(repaired_path)
+        except OSError:
+            pass
+
+    if r is None:
+        return None
+
+    logging.info(f"✅ CLIP encoded | dur={clip_dur:.3f}s | audio={has_audio}")
+    return chunk_path
+
 
 
 
@@ -15067,53 +18020,94 @@ def create_video(
     vid_segments=None,
     asset_folder=None,
     output_dir=OUTPUT,
-    
+    layout_config=None,
+    avatar_segment_map=None,
+    intro_teaser_config=None,
+    narration_images_config=None,
+    transition_banner_config=None,
 ):
     """
-    Main video creation function with support for smooth transitions between segments.
-    Includes comprehensive validation and failsafe mechanisms.
+    Main video creation function with support for smooth transitions
+    between segments. Includes comprehensive validation and failsafe
+    mechanisms.
 
-    transition_config keys:
-        enabled  (bool)  : whether to apply transitions
-        types    (list)  : ["zoom", "translation"] or specific effect names
-        max_pct  (float) : max % of segment duration for transition (default 0.15)
-        max_sec  (float) : hard cap in seconds (default 0.6)
+    Talking heads composite strategy:
+      - NO CLIPS  → post-assembly batch concat + overlay (zoom2.py)
+      - WITH CLIPS → batch-level avatar composite BEFORE concat,
+                      then final chunk prep loudness-matches every unit
+                      (avatar batchblocks + clipcomposited segments) to
+                      PIPELINE_AUDIO_TARGET_LUFS before copy-concat
+
+    layout_config + avatar_segment_map never touch encode_video_segment workers.
     """
-    # -----------------------------------------
-    # GLOBAL ORIENTATION + STORYBOARD + KENBURNS
-    # -----------------------------------------
     global CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_ORIENTATION
     global CURRENT_STORYBOARD_ENABLED, CURRENT_KENBURNS_ENABLED
 
-    print("NEW VALUES", orientation, storyboard, kenburns)
-    print ("Transition Config", transition_config)
+    from helper.teaser_backend import normalize_teaser_config
+    from helper.banner_backend import (
+        normalize_transition_banner,
+        apply_banner_boundary_transitions,
+    )
+    teaser_cfg = normalize_teaser_config(intro_teaser_config or {})
+    narration_images_cfg = narration_images_config or {}
+    banner_state = normalize_transition_banner(transition_banner_config or {})
 
+    logging.info(
+        f"📺 Intro teaser active | text={teaser_cfg.get('chyronText')!r} | "
+        f"layout={teaser_cfg.get('layoutMode')} | pos=({teaser_cfg.get('xPct')},{teaser_cfg.get('yPct')})"
+    )
+    logging.info(f"🖼 Narration image mode={narration_images_cfg.get('mode', 'default')}")
+    logging.info(
+        f"🎬 Transition banner | enabled={banner_state.get('enabled')} | "
+        f"preset={banner_state.get('preset_id')} | "
+        f"transition={banner_state.get('config', {}).get('transitionType')}"
+    )
+
+
+    print("NEW VALUES", orientation, storyboard, kenburns)
+    print("Transition Config", transition_config)
+    print(
+        "Talking Heads mode:",
+        layout_config is not None and avatar_segment_map is not None,
+    )
 
     CURRENT_ORIENTATION = orientation.lower().strip()
-    if CURRENT_ORIENTATION == "portrait":
-        CURRENT_WIDTH = 1080
-        CURRENT_HEIGHT = 1920
+    if layout_config and layout_config.get("canvas"):
+        canvas_w, canvas_h = _resolve_canvas(CURRENT_ORIENTATION, layout_config)
+    elif CURRENT_ORIENTATION == "portrait":
+        canvas_w, canvas_h = 1080, 1920
     else:
-        CURRENT_WIDTH = 1920
-        CURRENT_HEIGHT = 1080
+        canvas_w, canvas_h = 1920, 1080
+
+    CURRENT_WIDTH  = canvas_w
+    CURRENT_HEIGHT = canvas_h
 
     CURRENT_STORYBOARD_ENABLED = bool(storyboard)
-    CURRENT_KENBURNS_ENABLED = bool(kenburns)
+    CURRENT_KENBURNS_ENABLED   = bool(kenburns)
 
-    canvas_w = CURRENT_WIDTH
-    canvas_h = CURRENT_HEIGHT
+    kenburns_enabled = bool(kenburns)
+    from global_render_scheduler import get_scheduler
 
-    mp_manager = Manager()
-    gpu_semaphore = mp_manager.Semaphore(1)
+    scheduler = get_scheduler()
+    if not scheduler.initialized:
+        scheduler.init()
+    gpu_lock = scheduler.gpu_semaphore()
+    gpu_semaphore = gpu_lock
+    nvenc_semaphore = gpu_lock
+    storyboard_semaphore = scheduler.storyboard_semaphore()
+    sched_status = scheduler.status()
+    logging.info(
+        f"🌐 Global scheduler | GPU slots={sched_status['gpu_slots']} | "
+        f"storyboard slots={sched_status.get('storyboard_slots', STORYBOARD_MAX_CONCURRENT)} | "
+        f"segment workers={sched_status['segment_workers']} | "
+        f"kenburns={'on' if kenburns_enabled else 'off'}"
+    )
 
-    # -----------------------------------------
-    # DIRECTORY SETUP
-    # -----------------------------------------
     os.makedirs(output_dir, exist_ok=True)
     script_context = None
 
     if mode in ["create", "commentary", "original"]:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        timestamp   = time.strftime("%Y%m%d_%H%M%S")
         section_dir = os.path.join(TEMP_DIR, f"{timestamp}")
         os.makedirs(section_dir, exist_ok=True)
     else:
@@ -15121,21 +18115,18 @@ def create_video(
             intro_timestamp, body_timestamp = asset_folder.split("-")
             section_dir = os.path.join(
                 TEMP_DIR,
-                intro_timestamp if section_type == "intro" else body_timestamp
+                intro_timestamp if section_type == "intro" else body_timestamp,
             )
         else:
             section_dir = os.path.join(TEMP_DIR, asset_folder)
 
     output_path = os.path.join(
         output_dir,
-        f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        f"{section_type}_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
     )
 
-    # -----------------------------------------
-    # ORIGINAL MODE SETUP
-    # -----------------------------------------
     if mode == "original":
-        media_data = phase_media["phase_media"]
+        media_data     = phase_media["phase_media"]
         script_context = None
 
         vid_segments = assign_timeline_phases(
@@ -15146,12 +18137,24 @@ def create_video(
             finale_sec=phase_media["finale_sec"],
         )
 
+        if any(s.get("imagefx_required") for s in vid_segments):
+            from helper.imagefx_styles import SPACE_STYLE_KEY, generate_space_visual_bible
+
+            uses_space = any(
+                (s.get("ai_prompt") or "").strip().lower() == SPACE_STYLE_KEY
+                for s in vid_segments
+                if s.get("imagefx_required")
+            )
+            full_script = (script or narration_text or "").strip()
+            if uses_space and full_script:
+                logging.info("🎨 Building space visual bible for ImageFX...")
+                script_context = generate_space_visual_bible(full_script, client)
+                logging.info(f"📖 Space visual bible ready ({len(script_context)} chars)")
+
+    manager = None
     try:
         media_pool = []
 
-        # -------------------------------------------------
-        # PREPARE MEDIA POOL
-        # -------------------------------------------------
         if mode in ["create", "commentary", "original"]:
             logging.info(f"📦 Preparing media for {section_type}...")
 
@@ -15159,80 +18162,130 @@ def create_video(
                 clip_data_list, section_dir, user_id
             )
 
-            logging.info(f"✅ Completed {len(video_results)} video clips successfully.")
-            logging.info("⏳ Waiting for FFmpeg cleanup (5 seconds)...")
-            time.sleep(5)
+            logging.info(
+                f"✅ Completed {len(video_results)} video clips successfully."
+            )
+
+            skip_narration_media = _dreamface_skip_narration_media_pool(
+                layout_config, avatar_segment_map
+            )
+            if skip_narration_media:
+                logging.info(
+                    "⚡ full_avatar Talking Heads — tagged clips use ffprobe only; "
+                    "skipping narration image pool"
+                )
+
             logging.info("🔍 CHECKPOINT 1: Starting video processing...")
 
             for idx, result in enumerate(video_results):
                 try:
                     video_path = result["path"]
-                    logging.info(f"📹 Processing video {idx+1}/{len(video_results)}: {os.path.basename(video_path)}")
+                    logging.info(
+                        f"📹 Processing video {idx+1}/{len(video_results)}: "
+                        f"{os.path.basename(video_path)}"
+                    )
 
                     if not os.path.exists(video_path):
                         logging.error(f"❌ Video file missing: {video_path}")
                         continue
 
+                    use_fast_clip = bool(result.get("tag")) or skip_narration_media
+                    if use_fast_clip:
+                        if not _quick_video_file_ok(video_path):
+                            logging.error(
+                                f"❌ Video ffprobe check failed: {video_path}"
+                            )
+                            continue
+                        if not _verify_video_decodable(video_path):
+                            logging.error(
+                                f"❌ Video decode check failed (re-download or re-cut Grok clip): "
+                                f"{video_path}"
+                            )
+                            continue
+                        if not _append_tagged_clip_to_media_pool(
+                            media_pool, result, video_path
+                        ):
+                            logging.error(
+                                f"❌ Could not register clip (no duration): {video_path}"
+                            )
+                            continue
+                        logging.info(
+                            f"✅ Registered clip {idx+1}/{len(video_results)} "
+                            f"(fast, no CLIP embed)"
+                        )
+                        continue
+
                     file_size = os.path.getsize(video_path)
                     if file_size < 10000:
-                        logging.error(f"❌ Video file too small: {file_size} bytes")
+                        logging.error(
+                            f"❌ Video file too small: {file_size} bytes"
+                        )
                         continue
 
                     if not validate_video_file(video_path, max_retries=1):
-                        logging.error(f"❌ Video validation failed: {video_path}")
+                        logging.error(
+                            f"❌ Video validation failed: {video_path}"
+                        )
                         continue
 
-                    clip = VideoFileClip(video_path)
-                    logging.debug(f"   Opened clip: {clip.duration:.2f}s")
-
+                    clip      = VideoFileClip(video_path)
                     rep_frame = extract_representative_frame(clip)
-                    logging.debug(f"   Extracted representative frame")
-
                     embedding = encode_image_from_pil(rep_frame)
-                    logging.debug(f"   Encoded frame embedding")
 
                     media_pool.append({
-                        "type": "video",
-                        "path": video_path,
+                        "type":      "video",
+                        "path":      video_path,
                         "character": result["character"],
                         "embedding": embedding,
-                        "mute": result["mute"],
-                        "duration": clip.duration,
-                        "tag": result.get("tag")
+                        "mute":      result["mute"],
+                        "duration":  clip.duration,
+                        "tag":       result.get("tag"),
                     })
 
                     clip.close()
-                    if hasattr(clip, 'reader') and clip.reader:
+                    if hasattr(clip, "reader") and clip.reader:
                         clip.reader.close()
                     del clip
 
-                    logging.info(f"✅ Processed video {idx+1}/{len(video_results)}")
+                    logging.info(
+                        f"✅ Processed video {idx+1}/{len(video_results)}"
+                    )
 
                 except Exception as e:
                     logging.error(f"❌ Error processing video {idx+1}: {e}")
                     logging.error(traceback.format_exc())
 
-            logging.info(f"✅ All {len(video_results)} videos processed successfully")
+            logging.info(
+                f"✅ All {len(video_results)} videos processed successfully"
+            )
 
-            logging.info("🖼️  Processing images...")
-            image_paths = download_images_in_parallel(image_data_list, section_dir)
+            if skip_narration_media:
+                logging.info("⚡ Skipped image download/processing (full_avatar)")
+                image_paths = {}
+            else:
+                logging.info("🖼️  Processing images...")
+                image_paths = download_images_in_parallel(
+                    image_data_list, section_dir
+                )
 
             image_count = 0
             for character, img_list in image_paths.items():
                 for img_path in img_list:
                     try:
                         if not validate_image_file(img_path):
-                            logging.error(f"❌ Image validation failed: {img_path}")
+                            logging.error(
+                                f"❌ Image validation failed: {img_path}"
+                            )
                             continue
 
                         img = Image.open(img_path).convert("RGB")
                         media_pool.append({
-                            "type": "image",
-                            "path": img_path,
+                            "type":      "image",
+                            "path":      img_path,
                             "character": character,
                             "embedding": encode_image_from_pil(img),
-                            "duration": DEFAULT_DURATION,
-                            "used": False
+                            "duration":  DEFAULT_DURATION,
+                            "used":      False,
                         })
                         image_count += 1
                     except Exception as e:
@@ -15244,78 +18297,101 @@ def create_video(
             corrupt_count = 0
             for media in media_pool:
                 if media["type"] == "video":
-                    if not os.path.exists(media["path"]) or os.path.getsize(media["path"]) < 10000:
+                    if (
+                        not os.path.exists(media["path"])
+                        or os.path.getsize(media["path"]) < 10000
+                    ):
                         corrupt_count += 1
-                        logging.warning(f"⚠️ Corrupt video in pool: {media['path']}")
+                        logging.warning(
+                            f"⚠️ Corrupt video in pool: {media['path']}"
+                        )
                 elif media["type"] == "image":
-                    if not os.path.exists(media["path"]) or os.path.getsize(media["path"]) < 1000:
+                    if (
+                        not os.path.exists(media["path"])
+                        or os.path.getsize(media["path"]) < 1000
+                    ):
                         corrupt_count += 1
-                        logging.warning(f"⚠️ Corrupt image in pool: {media['path']}")
+                        logging.warning(
+                            f"⚠️ Corrupt image in pool: {media['path']}"
+                        )
 
             if corrupt_count > 0:
-                logging.warning(f"⚠️ Found {corrupt_count} potentially corrupt media files in pool")
+                logging.warning(
+                    f"⚠️ Found {corrupt_count} potentially corrupt "
+                    f"media files in pool"
+                )
             else:
-                logging.info("✅ All media pool files passed basic integrity check")
+                logging.info(
+                    "✅ All media pool files passed basic integrity check"
+                )
 
             save_metadata(media_pool, section_dir)
 
         else:
-            logging.info(f"♻️ Regenerating media for {section_type}...")
+            logging.info(
+                f"♻️ Regenerating media for {section_type}..."
+            )
             media_pool = load_metadata(section_dir)
 
-        # -------------------------------------------------
-        # SEGMENT ENCODING (MULTIPROCESSING)
-        # -------------------------------------------------
         logging.info("🧱 Encoding segments in parallel...")
         chunk_folder = os.path.join(section_dir, "chunks")
         os.makedirs(chunk_folder, exist_ok=True)
 
-        manager = Manager()
-        used_media_dict = manager.dict()
-        media_lock = manager.Lock()
-
+        manager            = Manager()
+        used_media_dict    = manager.dict()
+        media_lock         = manager.Lock()
         whisk_shared_state = manager.dict()
 
         if mode == "original":
-            needs_character = any(seg.get("whisk_required") for seg in vid_segments)
+            needs_character = any(
+                seg.get("whisk_required") for seg in vid_segments
+            )
 
             if needs_character:
                 character_id = next(
-                    (seg.get("character_id") for seg in vid_segments if seg.get("character_id")),
-                    None
+                    (
+                        seg.get("character_id")
+                        for seg in vid_segments
+                        if seg.get("character_id")
+                    ),
+                    None,
                 )
 
                 if not character_id:
-                    raise ValueError("whisk_required set but no character_id found in any segment")
+                    raise ValueError(
+                        "whisk_required set but no character_id found"
+                    )
 
                 char_context = initialize_whisk_character(
                     character_id=character_id,
-                    db=db,
-                    cookie=None
+                    db=get_db(),
+                    cookie=None,
                 )
 
                 if not char_context:
-                    raise ValueError("Failed to initialize Whisk character")
+                    raise ValueError(
+                        "Failed to initialize Whisk character"
+                    )
 
                 whisk_shared_state.update(char_context)
-                logging.info(f"🎭 Whisk character initialized: {char_context['character_name']}")
+                logging.info(
+                    f"🎭 Whisk character initialized: "
+                    f"{char_context['character_name']}"
+                )
             else:
-                logging.info("ℹ️  No Whisk character required for this video")
+                logging.info(
+                    "ℹ️  No Whisk character required for this video"
+                )
 
         from gpu_kenburns_simple import precompute_segment_effects
         effect_assignments, _video_seed = precompute_segment_effects(
             vid_segments=vid_segments,
         )
 
-        # -------------------------------------------------
-        # BUILD TRANSITION CONFIG (ALL MODES)
-        # Must happen BEFORE segment_info_list so we can
-        # pre-compute head_freeze_per_segment below
-        # -------------------------------------------------
         if transition_config is None:
             transition_config = {
                 "enabled": False,
-                "types": ["zoom", "translation"],
+                "types":   ["zoom", "translation"],
                 "max_pct": 0.15,
                 "max_sec": 0.6,
             }
@@ -15327,30 +18403,20 @@ def create_video(
             ]
 
         whoosh_config = {
-            "enabled": True,
-            "volume": 0.6,
-            "transitions": ["slideleft", "slideright", "slideup", "wipeleft", "wiperight", "wipeup"],
-            "mp3_path": "sounds/whoosh.mp3"
+            "enabled":     True,
+            "volume":      0.6,
+            "transitions": [
+                "slideleft", "slideright", "slideup",
+                "wipeleft",  "wiperight",  "wipeup",
+            ],
+            "mp3_path": "sounds/whoosh.mp3",
         }
 
-        # -------------------------------------------------
-        # PRE-COMPUTE HEAD FREEZE DURATION PER SEGMENT
-        # Option B: compute exact T per boundary in main
-        # process using same formula as transition engine.
-        # Passed to workers so KB delays by exactly T at
-        # the head of each segment that is transitioned into.
-        #
-        # Rules:
-        #   segment 0        → 0.0 (nothing transitions into it)
-        #   segment i > 0    → T computed from dur_a + dur_b
-        #   transitions off  → 0.0 for all
-        #   either side < 1s → 0.0 (transition engine skips it)
-        # -------------------------------------------------
         transitions_enabled = transition_config.get("enabled", False)
         max_pct             = float(transition_config.get("max_pct", 0.15))
         max_sec             = float(transition_config.get("max_sec", 0.6))
         min_frames          = 6
-        freeze_fps          = 30.0  # workers always encode at 30fps
+        freeze_fps          = 30.0
 
         def _get_audio_dur(path):
             if path and os.path.exists(path):
@@ -15363,22 +18429,20 @@ def create_video(
                     pass
             return 0.0
 
-        audio_durations = [_get_audio_dur(p) for p in segment_audio_paths]
+        audio_durations = [
+            _get_audio_dur(p) for p in segment_audio_paths
+        ]
 
         head_freeze_per_segment = []
         for i in range(len(vid_segments)):
             if not transitions_enabled or i == 0:
-                # First segment — nothing transitioning into it
                 head_freeze_per_segment.append(0.0)
             else:
                 dur_a = audio_durations[i - 1]
                 dur_b = audio_durations[i]
                 if dur_a < 1.0 or dur_b < 1.0:
-                    # Transition engine skips boundaries where
-                    # either side is shorter than MIN_SEG (1.0s)
                     head_freeze_per_segment.append(0.0)
                 else:
-                    # Mirror exact _compute_T from transition_engine.py
                     raw    = min(dur_a * max_pct, dur_b * max_pct, max_sec)
                     frames = max(min_frames, round(raw * freeze_fps))
                     T      = frames / freeze_fps
@@ -15389,10 +18453,9 @@ def create_video(
             f"{[round(t, 3) for t in head_freeze_per_segment]}"
         )
 
-        # -------------------------------------------------
-        # BUILD SEGMENT INFO LIST
-        # head_freeze_per_segment[i] added at end of tuple
-        # -------------------------------------------------
+        talking_heads_mode = bool(layout_config and avatar_segment_map)
+        has_clips          = _has_clip_segments(vid_segments) if talking_heads_mode else False
+
         segment_info_list = [
             (
                 segment,
@@ -15413,65 +18476,112 @@ def create_video(
                 kenburns,
                 avatar_active,
                 gpu_semaphore,
+                nvenc_semaphore,
                 effect_assignments[i],
                 whisk_shared_state,
-                head_freeze_per_segment[i],  # ✅ NEW: KB head freeze duration
+                head_freeze_per_segment[i],
+                talking_heads_mode,
+                teaser_cfg,
+                narration_images_cfg,
+                section_type,
+                storyboard_semaphore,
+                layout_config if talking_heads_mode else None,
             )
             for i, segment in enumerate(vid_segments)
         ]
 
-        with Pool(processes=min(5, cpu_count())) as pool:
-            chunk_paths = pool.map(encode_video_segment_with_retry, segment_info_list)
 
-        # -------------------------------------------------
-        # VALIDATE ALL SEGMENTS ARE PRESENT
-        # -------------------------------------------------
+
+        if talking_heads_mode:
+            mode_str = (
+                "batch-level before concat (clip video)"
+                if has_clips
+                else "post-assembly batch concat (no clips / zoom2)"
+            )
+            logging.info(
+                f"🎭 Talking Heads active | "
+                f"layout={layout_config.get('layout_id')} | "
+                f"segments={len(avatar_segment_map)} | {mode_str}"
+            )
+
+        total_seg = len(segment_info_list)
+        job_label = f"{section_type}:{os.path.basename(output_path)}"
+        logging.info(
+            f"🧱 Global pool encoding {total_seg} segment(s) for {job_label}..."
+        )
+        chunk_paths = scheduler.encode_segments(
+            segment_info_list,
+            job_label=job_label,
+        )
+
         logging.info("🔍 Validating segment completeness...")
 
-        validated_chunks = []
-        missing_segments = []
+        validated_chunks  = [None] * len(chunk_paths)
+        missing_segments  = []
         fallback_segments = []
 
         for i, path in enumerate(chunk_paths):
             if path and os.path.exists(path) and os.path.getsize(path) > 10000:
-                validated_chunks.append(path)
-
-                if "fallback" in os.path.basename(path) or "emergency" in os.path.basename(path):
+                validated_chunks[i] = path
+                if (
+                    "fallback"  in os.path.basename(path) or
+                    "emergency" in os.path.basename(path)
+                ):
                     fallback_segments.append(i)
-                    logging.warning(f"⚠️ Segment {i} is a FALLBACK placeholder")
+                    logging.warning(
+                        f"⚠️ Segment {i} is a FALLBACK placeholder"
+                    )
                 else:
-                    logging.debug(f"✅ Segment {i} validated: {os.path.basename(path)}")
+                    logging.debug(
+                        f"✅ Segment {i} validated: "
+                        f"{os.path.basename(path)}"
+                    )
             else:
                 missing_segments.append(i)
                 logging.error(f"❌ Segment {i} is MISSING or invalid")
 
-        total_segments     = len(vid_segments)
-        successful_segments = len(validated_chunks) - len(fallback_segments)
+        total_segments      = len(vid_segments)
+        successful_segments = sum(
+            1 for i, p in enumerate(validated_chunks)
+            if p and i not in fallback_segments
+        )
 
         logging.info(f"")
         logging.info(f"{'='*60}")
         logging.info(f"📊 SEGMENT ENCODING SUMMARY")
         logging.info(f"{'='*60}")
         logging.info(f"   Total segments:          {total_segments}")
-        logging.info(f"   ✅ Successfully encoded:   {successful_segments} ({successful_segments/total_segments*100:.1f}%)")
-        logging.info(f"   ⚠️  Fallback placeholders:  {len(fallback_segments)} ({len(fallback_segments)/total_segments*100:.1f}%)")
-        logging.info(f"   ❌ Missing/Failed:         {len(missing_segments)} ({len(missing_segments)/total_segments*100:.1f}%)")
-
+        logging.info(
+            f"   ✅ Successfully encoded:   {successful_segments} "
+            f"({successful_segments/total_segments*100:.1f}%)"
+        )
+        logging.info(
+            f"   ⚠️  Fallback placeholders:  {len(fallback_segments)} "
+            f"({len(fallback_segments)/total_segments*100:.1f}%)"
+        )
+        logging.info(
+            f"   ❌ Missing/Failed:         {len(missing_segments)} "
+            f"({len(missing_segments)/total_segments*100:.1f}%)"
+        )
         if fallback_segments:
-            logging.warning(f"   Fallback segment indices: {fallback_segments}")
+            logging.warning(
+                f"   Fallback segment indices: {fallback_segments}"
+            )
         if missing_segments:
-            logging.error(f"   Missing segment indices: {missing_segments}")
-
+            logging.error(
+                f"   Missing segment indices: {missing_segments}"
+            )
         logging.info(f"{'='*60}")
         logging.info(f"")
 
-        # Handle missing segments
         if missing_segments:
-            logging.critical("🚨 CRITICAL: Some segments are completely missing!")
+            logging.critical(
+                "🚨 CRITICAL: Some segments are completely missing!"
+            )
             logging.warning("🔧 Creating emergency placeholders...")
 
             for seg_idx in missing_segments:
-                segment   = vid_segments[seg_idx]
+                segment    = vid_segments[seg_idx]
                 audio_path = segment_audio_paths[seg_idx]
 
                 duration = 5.0
@@ -15482,10 +18592,10 @@ def create_video(
                         audio_clip.close()
                         del audio_clip
                     except Exception:
-                        words    = len(segment.get('text', '').split())
+                        words    = len(segment.get("text", "").split())
                         duration = max(3.0, words * 0.35)
                 else:
-                    words    = len(segment.get('text', '').split())
+                    words    = len(segment.get("text", "").split())
                     duration = max(3.0, words * 0.35)
 
                 try:
@@ -15496,43 +18606,161 @@ def create_video(
                         segment_index=seg_idx,
                         audio_path=audio_path,
                         chunk_folder=chunk_folder,
-                        reason="Emergency - segment completely missing"
+                        reason="Emergency - segment completely missing",
                     )
 
                     if emergency_path and os.path.exists(emergency_path):
-                        validated_chunks.insert(seg_idx, emergency_path)
+                        validated_chunks[seg_idx] = emergency_path
                         fallback_segments.append(seg_idx)
-                        logging.info(f"✅ Emergency placeholder inserted for segment {seg_idx}")
+                        logging.info(
+                            f"✅ Emergency placeholder inserted "
+                            f"for segment {seg_idx}"
+                        )
                     else:
-                        logging.critical(f"💥 FATAL: Cannot create emergency placeholder for segment {seg_idx}")
-                        validated_chunks.insert(seg_idx, None)
+                        logging.critical(
+                            f"💥 FATAL: Cannot create emergency "
+                            f"placeholder for segment {seg_idx}"
+                        )
+                        validated_chunks[seg_idx] = None
 
                 except Exception as e:
-                    logging.critical(f"💥 Emergency placeholder creation failed for segment {seg_idx}: {e}")
+                    logging.critical(
+                        f"💥 Emergency placeholder creation failed "
+                        f"for segment {seg_idx}: {e}"
+                    )
                     logging.error(traceback.format_exc())
-                    validated_chunks.insert(seg_idx, None)
+                    validated_chunks[seg_idx] = None
 
         chunk_paths = validated_chunks
 
         if not chunk_paths or None in chunk_paths:
-            none_count = chunk_paths.count(None) if chunk_paths else total_segments
-            error_msg  = f"Video generation FAILED: {none_count}/{total_segments} segments could not be created"
+            none_count = (
+                chunk_paths.count(None) if chunk_paths else total_segments
+            )
+            error_msg = (
+                f"Video generation FAILED: "
+                f"{none_count}/{total_segments} segments could not be created"
+            )
             logging.critical(f"💥 {error_msg}")
 
             send_telegram_notification(
                 f"🚨 VIDEO GENERATION FAILED\n\n{error_msg}\n\n"
-                f"Missing segments: {missing_segments}\nFallback segments: {fallback_segments}",
+                f"Missing segments: {missing_segments}\n"
+                f"Fallback segments: {fallback_segments}",
                 "Critical Failure",
                 "https://claude.ai/error",
-                user_id or "Unknown"
+                user_id or "Unknown",
             )
 
             raise RuntimeError(error_msg)
 
         logging.info(f"✅ Proceeding with {len(chunk_paths)} segments")
         if fallback_segments:
-            logging.warning(f"⚠️  Including {len(fallback_segments)} BLACK PLACEHOLDER segments (will need manual editing)")
-            logging.warning(f"   Black placeholder segment indices: {fallback_segments}")
+            logging.warning(
+                f"⚠️  Including {len(fallback_segments)} BLACK "
+                f"PLACEHOLDER segments (will need manual editing)"
+            )
+            logging.warning(
+                f"   Black placeholder segment indices: {fallback_segments}"
+            )
+
+        # -------------------------------------------------
+        # CLIP VIDEOS: batch-level avatar composite BEFORE concat
+        # NO-CLIP VIDEOS: skip here — composite post-assembly (zoom2)
+        # -------------------------------------------------
+        if talking_heads_mode and has_clips:
+            logging.info("🎭 Clip video → batch-level avatar composite")
+            try:
+                chunk_paths = _apply_batch_avatar_composite(
+                    chunk_paths        = chunk_paths,
+                    avatar_segment_map = avatar_segment_map,
+                    vid_segments       = vid_segments,
+                    layout_config      = layout_config,
+                    canvas_w           = canvas_w,
+                    canvas_h           = canvas_h,
+                    chunk_folder       = chunk_folder,
+                )
+            except Exception as e:
+                logging.error(
+                    f"❌ Batch composite error: {e}", exc_info=True
+                )
+                logging.warning("⚠️ Continuing with content-only chunks")
+
+        # -------------------------------------------------
+        # LOUDNESS — level each avatar / clip chunk on its own BEFORE banners
+        # (one steady gain per chunk; levelling the joined file afterwards
+        # made the start of narration pump after long muted clips)
+        # -------------------------------------------------
+        pre_leveled = False
+        if talking_heads_mode and has_clips:
+            try:
+                chunk_paths = _loudness_match_chunks(chunk_paths, chunk_folder)
+                pre_leveled = True
+            except Exception as e:
+                logging.error(f"❌ Loudness matching failed — continuing: {e}", exc_info=True)
+
+        # -------------------------------------------------
+        # TRANSITION BANNER — narration ↔ CLIP boundaries
+        # (chunk prep runs AFTER banner so banner_merge_* is included)
+        # -------------------------------------------------
+        if banner_state.get("enabled"):
+            batch_groups = None
+            if talking_heads_mode and has_clips and avatar_segment_map:
+                batch_groups = _group_batches_from_map(avatar_segment_map)
+            static_root = os.getenv("STATIC_ROOT") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "static"
+            )
+            try:
+                chunk_paths = apply_banner_boundary_transitions(
+                    chunk_paths=chunk_paths,
+                    vid_segments=vid_segments,
+                    banner_state=banner_state,
+                    canvas_w=canvas_w,
+                    canvas_h=canvas_h,
+                    chunk_folder=chunk_folder,
+                    talking_heads_mode=talking_heads_mode,
+                    has_clips=has_clips,
+                    batch_groups=batch_groups,
+                    static_root=static_root,
+                )
+            except Exception as e:
+                logging.error(
+                    f"❌ Transition banner failed — continuing without banners: {e}",
+                    exc_info=True,
+                )
+
+        # CLIP ↔ CLIP transitions removed for now — successive clips are joined
+        # with hard cuts. (helper/clip_segment_transitions.py is kept for later.)
+
+        # -------------------------------------------------
+        # PREP ALL FINAL CONCAT UNITS — PTS=0 before copy-concat
+        # Includes clipcomposited_*, banner_merge_*, normaud_*, etc.
+        # Fixes successive CLIP desync at chunk seams.
+        # -------------------------------------------------
+        match_avatar_clip_loudness = talking_heads_mode and has_clips and not pre_leveled
+        if match_avatar_clip_loudness:
+            logging.info(
+                f"🔊 Final chunk prep will loudness-match avatar + clip audio "
+                f"to {PIPELINE_AUDIO_TARGET_LUFS} LUFS"
+            )
+        logging.info("🧩 Preparing all chunks for final concat (post-banner)...")
+        final_prepared = []
+        prep_total = len(chunk_paths)
+        for idx, p in enumerate(chunk_paths):
+            if not p:
+                final_prepared.append(p)
+                continue
+            if idx == 0 or (idx + 1) % 25 == 0 or idx + 1 == prep_total:
+                logging.info(f"🧩 Final chunk prep {idx + 1}/{prep_total}...")
+            ready = os.path.join(
+                chunk_folder, f"ready_final_{idx}_{int(time.time() * 1000)}.mp4"
+            )
+            fixed = _prepare_chunk_for_concat(
+                p, ready, loudness_normalize=match_avatar_clip_loudness
+            )
+            final_prepared.append(fixed or p)
+        chunk_paths = final_prepared
+        logging.info(f"✅ Final chunk prep complete | {len(chunk_paths)} chunks")
 
         # -------------------------------------------------
         # FINAL CONCAT
@@ -15540,17 +18768,20 @@ def create_video(
         logging.info("📦 Final assembly via FFmpeg concat...")
         concat_txt_path = os.path.join(chunk_folder, "concat.txt")
 
-        with open(concat_txt_path, "w") as f:
+        with open(concat_txt_path, "w", encoding="utf-8") as f:
             for path in chunk_paths:
-                f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
+                f.write(
+                    f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n"
+                )
 
-        # -------------------------------------------------
-        # ASSEMBLY: TRANSITIONS OR SIMPLE CONCAT
-        # -------------------------------------------------
         if transition_config.get("enabled"):
-            logging.info("🎬 Transitions enabled — applying transitions before final assembly...")
+            logging.info(
+                "🎬 Transitions enabled — applying before final assembly..."
+            )
 
-            temp_video_no_audio = os.path.join(chunk_folder, "temp_video_no_audio.mp4")
+            temp_video_no_audio = os.path.join(
+                chunk_folder, "temp_video_no_audio.mp4"
+            )
 
             apply_transitions_and_concat(
                 chunk_paths,
@@ -15560,7 +18791,9 @@ def create_video(
             )
 
             if mode == "original" and full_audio:
-                logging.info("🎵 Original mode — overlaying full audio track...")
+                logging.info(
+                    "🎵 Original mode — overlaying full audio track..."
+                )
                 ffmpeg_cmd = [
                     "ffmpeg",
                     "-i", temp_video_no_audio,
@@ -15571,42 +18804,117 @@ def create_video(
                     "-map", "1:a:0",
                     "-shortest",
                     "-movflags", "+faststart",
-                    "-y", output_path
+                    "-y", output_path,
                 ]
                 try:
-                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-                    logging.info("✅ Audio overlay completed successfully")
+                    subprocess.run(
+                        ffmpeg_cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    logging.info(
+                        "✅ Audio overlay completed successfully"
+                    )
                 except subprocess.CalledProcessError as e:
-                    logging.error(f"❌ FFmpeg audio overlay failed: {e.stderr}")
+                    logging.error(
+                        f"❌ FFmpeg audio overlay failed: {e.stderr}"
+                    )
                     raise
                 finally:
                     if os.path.exists(temp_video_no_audio):
                         os.remove(temp_video_no_audio)
             else:
-                logging.info("🎵 Commentary/create mode — audio already baked in, finalizing...")
+                logging.info(
+                    "🎵 Commentary/create mode — "
+                    "audio baked in, finalizing..."
+                )
                 os.rename(temp_video_no_audio, output_path)
 
         else:
-            logging.info("🎬 Standard concat (no transitions)")
-            ffmpeg_cmd = [
-                "ffmpeg", "-f", "concat", "-safe", "0",
+            logging.info("🎬 Standard concat (no transitions) — copy first")
+            copy_cmd = [
+                "ffmpeg", "-y",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-f", "concat", "-safe", "0",
                 "-i", concat_txt_path,
-                "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-                "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M",
-                "-bufsize", "24M",
-                "-profile:v", "high", "-pix_fmt", "yuv420p",
-                "-colorspace", "bt709", "-color_primaries", "bt709",
-                "-color_trc", "bt709",
-                "-c:a", "aac", "-b:a", "192k",
+                "-c", "copy",
                 "-movflags", "+faststart",
-                "-y", output_path
+                output_path,
             ]
             try:
-                subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-                logging.info("✅ Video concatenation completed successfully")
+                subprocess.run(
+                    copy_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                logging.info("✅ Copy concat completed successfully")
             except subprocess.CalledProcessError as e:
-                logging.error(f"❌ FFmpeg concat failed: {e.stderr}")
-                raise
+                logging.warning(
+                    f"⚠️ Copy concat failed — fallback NVENC re-encode:\n"
+                    f"{e.stderr[-500:]}"
+                )
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-fflags", "+genpts",
+                    "-avoid_negative_ts", "make_zero",
+                    "-f", "concat", "-safe", "0",
+                    "-i", concat_txt_path,
+                    "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
+                    "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M",
+                    "-bufsize", "24M",
+                    "-profile:v", "high", "-pix_fmt", "yuv420p",
+                    "-colorspace",      "bt709",
+                    "-color_primaries", "bt709",
+                    "-color_trc",       "bt709",
+                    "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    output_path,
+                ]
+                subprocess.run(
+                    ffmpeg_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                logging.info(
+                    "✅ Re-encode concatenation completed successfully"
+                )
+
+        # -------------------------------------------------
+        # NO-CLIP VIDEOS: post-assembly batch concat composite (zoom2)
+        # -------------------------------------------------
+        if talking_heads_mode and not has_clips:
+            logging.info(
+                "🎭 No-clip video → post-assembly batch concat composite"
+            )
+            try:
+                composited = _composite_avatar_over_full_video(
+                    content_video      = output_path,
+                    avatar_segment_map = avatar_segment_map,
+                    layout_config      = layout_config,
+                    canvas_w           = canvas_w,
+                    canvas_h           = canvas_h,
+                    chunk_folder       = chunk_folder,
+                )
+                if composited and os.path.exists(composited):
+                    os.replace(composited, output_path)
+                    new_size = os.path.getsize(output_path) / (1024 * 1024)
+                    logging.info(
+                        f"✅ Talking Heads composite complete → "
+                        f"{output_path} ({new_size:.1f}MB)"
+                    )
+                else:
+                    logging.warning(
+                        "⚠️ Composite returned None — keeping content-only video"
+                    )
+            except Exception as e:
+                logging.error(
+                    f"❌ Talking Heads composite error: {e}", exc_info=True
+                )
+                logging.warning("⚠️ Continuing without avatar composite")
 
         # -------------------------------------------------
         # BACKGROUND MUSIC
@@ -15617,49 +18925,55 @@ def create_video(
                 add_background_music(output_path, background)
                 logging.info("✅ Background music added successfully")
             except Exception as e:
-                logging.error(f"❌ Background music addition failed: {e}")
-                logging.warning("⚠️  Continuing without background music")
+                logging.error(
+                    f"❌ Background music addition failed: {e}"
+                )
+                logging.warning(
+                    "⚠️  Continuing without background music"
+                )
         else:
             logging.info("ℹ️  No background music specified")
 
         # -------------------------------------------------
-        # CAPTIONS/SUBTITLES
+        # CAPTIONS / SUBTITLES
         # -------------------------------------------------
         if captions_enabled and srt and os.path.exists(srt):
             logging.info("📝 Burning subtitles into final video...")
-
             subbed_output_path = output_path.replace(".mp4", "_subbed.mp4")
-
             try:
                 success = burn_srt_to_video(
                     input_video=output_path,
                     srt_file=srt,
                     output_video=subbed_output_path,
-                    caption_settings=caption_settings
+                    caption_settings=caption_settings,
                 )
-
                 if success:
                     try:
                         os.remove(output_path)
                         os.rename(subbed_output_path, output_path)
-                        logging.info(f"✅ Subtitles burned successfully → {output_path}")
+                        logging.info(
+                            f"✅ Subtitles burned → {output_path}"
+                        )
                     except Exception as e:
-                        logging.error(f"❌ Failed to replace original video: {e}")
+                        logging.error(
+                            f"❌ Failed to replace original video: {e}"
+                        )
                         if os.path.exists(subbed_output_path):
                             output_path = subbed_output_path
                 else:
-                    logging.warning("⚠️  Subtitle burning failed, continuing without subtitles")
-
+                    logging.warning(
+                        "⚠️  Subtitle burning failed, "
+                        "continuing without subtitles"
+                    )
             except Exception as e:
                 logging.error(f"❌ Subtitle burning crashed: {e}")
                 logging.warning("⚠️  Continuing without subtitles")
         else:
             if captions_enabled:
-                logging.warning("⚠️  Captions enabled but no SRT file provided")
+                logging.warning(
+                    "⚠️  Captions enabled but no SRT file provided"
+                )
 
-        # -------------------------------------------------
-        # CLEANUP
-        # -------------------------------------------------
         cleanup_files = ["output.srt", "temp_audio.mp3"]
         for f in cleanup_files:
             if os.path.exists(f):
@@ -15669,34 +18983,43 @@ def create_video(
                 except Exception as e:
                     logging.warning(f"⚠️  Could not remove {f}: {e}")
 
-        # -------------------------------------------------
-        # FINAL VALIDATION
-        # -------------------------------------------------
         if os.path.exists(output_path):
             final_size = os.path.getsize(output_path)
             if final_size < 100000:
-                logging.error(f"⚠️  Final video file is suspiciously small: {final_size} bytes")
+                logging.error(
+                    f"⚠️  Final video suspiciously small: "
+                    f"{final_size} bytes"
+                )
             else:
-                logging.info(f"✅ Final video size: {final_size / (1024*1024):.2f} MB")
+                logging.info(
+                    f"✅ Final video size: "
+                    f"{final_size / (1024*1024):.2f} MB"
+                )
 
         logging.info(f"")
         logging.info(f"{'='*60}")
         logging.info(f"🎉 VIDEO GENERATION COMPLETE")
         logging.info(f"{'='*60}")
         logging.info(f"   Output: {output_path}")
-        logging.info(f"   Total segments: {total_segments}")
-        logging.info(f"   Successful: {successful_segments}")
-        logging.info(f"   Fallbacks: {len(fallback_segments)}")
+        logging.info(f"   Total segments:    {total_segments}")
+        logging.info(f"   Successful:        {successful_segments}")
+        logging.info(f"   Fallbacks:         {len(fallback_segments)}")
         if fallback_segments:
             logging.info(f"   ⚠️  BLACK SEGMENTS: {fallback_segments}")
-            logging.info(f"   ⚠️  These segments need manual editing!")
+            logging.info(
+                f"   ⚠️  These segments need manual editing!"
+            )
         logging.info(f"{'='*60}")
         logging.info(f"")
 
         return (
             output_path,
-            (timestamp if mode in ["create", "commentary", "original"] else asset_folder),
-            lambda: print("✅ Done!")
+            (
+                timestamp
+                if mode in ["create", "commentary", "original"]
+                else asset_folder
+            ),
+            lambda: print("✅ Done!"),
         )
 
     except Exception as e:
@@ -15704,7 +19027,9 @@ def create_video(
         logging.error(f"🚨 Video generation error:\n{full_trace}")
 
         send_telegram_notification(
-            f"🚨 VIDEO GENERATION FAILED\n\nError: {str(e)}\n\nFull trace:\n{full_trace[:500]}",
+            f"🚨 VIDEO GENERATION FAILED\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Full trace:\n{full_trace[:500]}",
             "Failure",
             "https://claude.ai/error",
             user_id or "Unknown",
@@ -15713,6 +19038,11 @@ def create_video(
         return None, None, None
 
     finally:
+        if manager is not None:
+            try:
+                manager.shutdown()
+            except Exception as exc:
+                logging.debug(f"Manager shutdown: {exc}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

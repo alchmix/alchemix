@@ -1,487 +1,346 @@
 """
-Cult Beauty → WooCommerce CSV Scraper (Multithreaded)
-======================================================
-Scrapes: category PLPs (paginated) → individual product pages
-Output:  woocommerce_products.csv
-
-Threading model:
-  - PLP pagination runs sequentially (one category at a time)
-  - Product page requests run in parallel (PRODUCT_THREADS workers)
-  - A threading.Lock protects the shared seen_skus set and rows list
-  - Each thread has its own random delay so requests are staggered
-
-RUN:
-  pip install requests beautifulsoup4 lxml
-  python cultbeauty_scraper.py
+zoom2.py — news_broadcast layout composite test
+─────────────────────────────────────────────────
+Tests _composite_avatar_over_full_video logic with
+the exact news_broadcast layout config.
 """
 
-import csv
-import json
-import re
-import time
-import random
-import logging
-import threading
-from pathlib import Path
-from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, json, logging, subprocess, time, re
 
-import requests
-from bs4 import BeautifulSoup
-
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("scraper.log", encoding="utf-8"),
-    ],
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL        = "https://www.cultbeauty.com"
-OUTPUT          = Path("woocommerce_products.csv")
-MAX_PAGES       = None   # None = all pages; set e.g. 3 to limit during testing
-PRODUCT_THREADS = 5      # parallel product page workers (keep ≤ 8 to be polite)
-DELAY_MIN       = 1.0    # per-thread delay between requests
-DELAY_MAX       = 2.5
+BACKEND_ROOT  = r"D:\Alchemy Mix\backend"
+CONTENT_VIDEO = os.path.join(BACKEND_ROOT, "outputs",           "final_20260610_152907.mp4")
+AVATAR_0      = os.path.join(BACKEND_ROOT, "static", "avatars", "avatar_900374860e64.mp4")
+AVATAR_1      = os.path.join(BACKEND_ROOT, "static", "avatars", "avatar_430cc42f411e.mp4")
+OUT_DIR       = os.path.join(BACKEND_ROOT, "test_output")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml;q=0.9,*/*;q=0.8",
+CANVAS_W  = 1920
+CANVAS_H  = 1080
+PREVIEW_W = 560
+
+LAYOUT_CONFIG = {
+    "layout_id": "news_broadcast",
+    "background": "blurred",
+    "avatar_layer": {
+        "x": 26, "y": 437, "width": 499, "height": 603,
+        "border": {"width": 4, "color": "#f5f5f5", "radius": 0},
+    },
+    "content_layer": {
+        "x": 617, "y": 101, "width": 1251, "height": 617,
+        "border": {"width": 4, "color": "#ffffff", "radius": 0},
+    },
 }
 
-# ── Category URLs ─────────────────────────────────────────────────────────────
-# (url, woocommerce_category_path)
-# Only real PLPs — no hub pages, no brand pages
-CATEGORY_URLS = [
 
-    # ── SKIN CARE ─────────────────────────────────────────────────────────────
-    ("https://www.cultbeauty.com/c/skin-care/moisturisers/",            "Skin Care > Face Moisturisers"),
-    ("https://www.cultbeauty.com/c/skin-care/serums/",                  "Skin Care > Serums"),
-    ("https://www.cultbeauty.com/c/skin-care/cleansers-toners/",        "Skin Care > Cleansers & Toners"),
-    ("https://www.cultbeauty.com/c/skin-care/toners-mists/toner/",      "Skin Care > Toners & Mists"),
-    ("https://www.cultbeauty.com/c/skin-care/lips/",                    "Skin Care > Lip Care"),
-    ("https://www.cultbeauty.com/c/spf/shop-all/",                      "Skin Care > SPF"),
-
-    # ── FRAGRANCE ─────────────────────────────────────────────────────────────
-    ("https://www.cultbeauty.com/c/fragrance/shop-all/",                "Fragrance > Shop All"),
-    ("https://www.cultbeauty.com/c/fragrance/perfumes/",                "Fragrance > Perfumes"),
-    ("https://www.cultbeauty.com/c/fragrance/discovery-sets/",          "Fragrance > Discovery Sets"),
-    ("https://www.cultbeauty.com/c/fragrance/aftershave/",              "Fragrance > Aftershave"),
-    ("https://www.cultbeauty.com/c/fragrance/home-fragrance/",          "Fragrance > Home Fragrance"),
-    ("https://www.cultbeauty.com/c/hair-care/hair-mists/",              "Fragrance > Hair Mists"),
-
-    # ── MAKE UP ───────────────────────────────────────────────────────────────
-    ("https://www.cultbeauty.com/c/make-up/complexion/",                "Make Up > Complexion"),
-    ("https://www.cultbeauty.com/c/make-up/eyes/",                      "Make Up > Eyes"),
-    ("https://www.cultbeauty.com/c/make-up/lips/",                      "Make Up > Lips"),
-    ("https://www.cultbeauty.com/c/make-up/brows/",                     "Make Up > Brows"),
-    ("https://www.cultbeauty.com/c/make-up/brushes/",                   "Make Up > Brushes & Tools"),
-
-    # ── BODY & WELLBEING ──────────────────────────────────────────────────────
-    ("https://www.cultbeauty.com/c/body-wellbeing/moisturisers/",       "Body & Wellbeing > Body Moisturisers"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/cleansers/",          "Body & Wellbeing > Body Cleansers"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/body-oil-shimmers/",  "Body & Wellbeing > Body Oils & Shimmers"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/scrubs-exfoliators/", "Body & Wellbeing > Scrubs & Exfoliators"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/personal-care/",      "Body & Wellbeing > Personal Care"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/vitamins-supplements/","Body & Wellbeing > Vitamins & Supplements"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/tanning-suncare/tanning/","Body & Wellbeing > Tanning & Sun Care"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/wellbeing/aromatherapy/","Body & Wellbeing > Aromatherapy"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/wellbeing/sleep/",    "Body & Wellbeing > Sleep"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/hands-feet/hand-cream/","Body & Wellbeing > Hands & Feet"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/wellbeing/female-wellness/","Body & Wellbeing > Female Wellness"),
-    ("https://www.cultbeauty.com/c/body-wellbeing/tools-technology/",   "Body & Wellbeing > Tools & Technology"),
-]
-
-# ── WooCommerce CSV columns ───────────────────────────────────────────────────
-WC_COLUMNS = [
-    "ID", "Type", "SKU", "Name", "Published", "Is featured?",
-    "Visibility in catalog", "Short description", "Description",
-    "Date sale price starts", "Date sale price ends",
-    "Tax status", "Tax class", "In stock?", "Stock",
-    "Backorders allowed?", "Sold individually?",
-    "Weight (kg)", "Length (cm)", "Width (cm)", "Height (cm)",
-    "Allow customer reviews?", "Purchase note",
-    "Sale price", "Regular price",
-    "Categories", "Tags", "Shipping class",
-    "Images",
-    "Download limit", "Download expiry days",
-    "Parent", "Grouped products", "Upsells", "Cross-sells",
-    "External URL", "Button text", "Position",
-    "Attribute 1 name", "Attribute 1 value(s)",
-    "Attribute 1 visible", "Attribute 1 global",
-    "Attribute 2 name", "Attribute 2 value(s)",
-    "Attribute 2 visible", "Attribute 2 global",
-    "Meta: _yoast_wpseo_title", "Meta: _yoast_wpseo_metadesc",
-    "Brands",
-]
-
-# ── Thread-local session (each thread reuses its own connection pool) ─────────
-_local = threading.local()
-
-def get_session() -> requests.Session:
-    if not hasattr(_local, "session"):
-        s = requests.Session()
-        s.headers.update(HEADERS)
-        _local.session = s
-    return _local.session
-
-
-# ── HTTP ──────────────────────────────────────────────────────────────────────
-def get(url: str, retries: int = 3) -> BeautifulSoup | None:
-    session = get_session()
-    for attempt in range(retries):
-        try:
-            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-            r = session.get(url, timeout=25)
-            r.raise_for_status()
-            r.encoding = "utf-8"  # fix accented chars (Néroli, Nécessaire etc.)
-            return BeautifulSoup(r.text, "lxml")
-        except Exception as exc:
-            log.warning(f"Attempt {attempt + 1} failed for {url}: {exc}")
-            time.sleep(4 * (attempt + 1))
-    log.error(f"Giving up on {url}")
-    return None
-
-
-# ── PLP helpers ───────────────────────────────────────────────────────────────
-def parse_breadcrumbs(soup: BeautifulSoup) -> str:
-    nav = soup.find("nav", {"aria-label": "Breadcrumbs"})
-    if not nav:
-        return ""
-    items = nav.find_all("li")
-    parts = [li.get_text(strip=True) for li in items[1:]]
-    parts = [p for p in parts if p and p.lower() != "home"]
-    return " > ".join(parts)
-
-
-def get_product_links(soup: BeautifulSoup) -> list[str]:
-    links = []
-    for card in soup.select("product-card-wrapper"):
-        a = card.select_one("a.product-item")
-        if a and a.get("href"):
-            links.append(urljoin(BASE_URL, a["href"]))
-    return list(dict.fromkeys(links))
-
-
-def get_next_page(soup: BeautifulSoup) -> str | None:
-    a = soup.select_one("a.next-page-button[data-hasmore='true']")
-    if not a or not a.get("href"):
-        return None
-    href = a["href"]
-    return href if href.startswith("http") else urljoin(BASE_URL, href)
-
-
-# ── Product page helpers ──────────────────────────────────────────────────────
-def extract_default_variant(soup: BeautifulSoup) -> dict:
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        if "defaultVariant" not in text:
-            continue
-        m = re.search(
-            r"const\s+defaultVariant\s*=\s*(\{.+?\});\s*(?:\n|window)",
-            text, re.S,
+def probe_duration(path):
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            capture_output=True, text=True,
         )
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-    return {}
+        for s in json.loads(r.stdout).get("streams", []):
+            d = float(s.get("duration", 0))
+            if d > 0:
+                return d
+    except Exception as e:
+        logging.warning(f"probe_duration failed: {e}")
+    return 0.0
 
 
-def html_to_text(html_str: str) -> str:
-    if not html_str:
-        return ""
-    return BeautifulSoup(html_str, "lxml").get_text(" ", strip=True)
+def drawbox(x, y, w, h, border_w, color_hex, radius):
+    t   = max(1, min(border_w, min(w, h) // 2))
+    col = f"{color_hex}@1.0"
+    if radius <= 0:
+        return f"drawbox=x={x}:y={y}:w={w}:h={h}:color={col}:t={t}"
+    r = max(1, min(radius, w // 2, h // 2))
+    return ",".join([
+        f"drawbox=x={x+r}:y={y}:w={w-2*r}:h={t}:color={col}:t=fill",
+        f"drawbox=x={x+r}:y={y+h-t}:w={w-2*r}:h={t}:color={col}:t=fill",
+        f"drawbox=x={x}:y={y+r}:w={t}:h={h-2*r}:color={col}:t=fill",
+        f"drawbox=x={x+w-t}:y={y+r}:w={t}:h={h-2*r}:color={col}:t=fill",
+    ])
 
 
-def get_content_value(content_list: list, key: str) -> str:
-    for item in content_list:
-        if item.get("key") != key:
-            continue
-        val = item.get("value", {})
-        tn  = val.get("__typename", "")
-        if tn == "ProductContentRichContentValue":
-            parts = val.get("richContentValue", {}).get("content", [])
-            return " ".join(p.get("content", "") for p in parts)
-        if tn == "ProductContentRichContentListValue":
-            out = []
-            for rc in val.get("richContentListValue", []):
-                out += [p.get("content", "") for p in rc.get("content", [])]
-            return " ".join(out)
-        if tn == "ProductContentStringValue":
-            return val.get("stringValue", "")
-        if tn == "ProductContentStringListValue":
-            return ", ".join(val.get("stringListValue", []))
-    return ""
-
-
-def extract_sku(url: str) -> str:
-    m = re.search(r"/p/[^/]+/(\d+)/", url)
-    return m.group(1) if m else ""
-
-
-def extract_variants(variant_data: dict) -> tuple[str, str]:
-    choices = variant_data.get("choices", [])
-    if not choices:
-        return "", ""
-    has_colour = any(c.get("colour") for c in choices)
-    attr_name = "Shade" if has_colour else "Size"
-    values = [c.get("title") or c.get("key", "") for c in choices if c.get("title") or c.get("key")]
-    return attr_name, "|".join(values)
-
-
-# ── Product page parser (called from worker threads) ──────────────────────────
-def parse_product_page(url: str, fallback_category: str) -> dict | None:
-    soup = get(url)
-    if not soup:
+def concat_avatars(avatar_paths, tmp_dir):
+    """Stream-copy concat — no decode, ~1s."""
+    out = os.path.join(tmp_dir, f"avatar_track_{int(time.time()*1000)}.mp4")
+    txt = os.path.join(tmp_dir, "avatar_concat.txt")
+    with open(txt, "w") as f:
+        for p in avatar_paths:
+            f.write(f"file '{os.path.abspath(p).replace(os.sep, '/')}'\n")
+    t0 = time.time()
+    r  = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", txt,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        out,
+    ], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out):
+        logging.error(f"❌ avatar concat failed:\n{r.stderr[-400:]}")
         return None
-
-    sku = extract_sku(url)
-
-    h1 = soup.find("h1", id="product-title")
-    title = h1.get_text(" ", strip=True) if h1 else ""
-    if not title:
-        t = soup.find("title")
-        title = t.get_text(strip=True).split("|")[0].strip() if t else ""
-
-    brand_a = soup.select_one("a.override-pdp-brand")
-    brand = brand_a.get_text(strip=True) if brand_a else ""
-
-    bc = parse_breadcrumbs(soup)
-    category = bc if bc else fallback_category
-
-    # Variant JSON extracted FIRST — used by price, images, content, variants
-    variant_data = extract_default_variant(soup)
-
-    # Price — 3 fallback levels
-    price = ""
-    if variant_data:
-        try:
-            price = str(
-                variant_data.get("price", {})
-                            .get("price", {})
-                            .get("amount", "")
-            )
-        except Exception:
-            pass
-    if not price:
-        price_el = soup.find(id="product-price")
-        if price_el:
-            price = re.sub(r"[€£$,\s]", "", price_el.get_text(strip=True))
-    if not price:
-        for sel in [".price span", ".product-price span", "span.price"]:
-            p_el = soup.select_one(sel)
-            if p_el:
-                candidate = re.sub(r"[€£$,\s]", "", p_el.get_text(strip=True))
-                if re.match(r"^\d+\.?\d*$", candidate):
-                    price = candidate
-                    break
-
-    # Images
-    images = []
-    for img in variant_data.get("images", []):
-        orig = img.get("original", "")
-        if orig:
-            images.append(
-                orig if orig.startswith("http")
-                else f"https://static.thcdn.com/productimg/original/{Path(orig).name}"
-            )
-    if not images:
-        for img_tag in soup.select(".carouselImages img, .product-images img"):
-            src = img_tag.get("src") or img_tag.get("data-src", "")
-            if "productimg" in src and src not in images:
-                images.append(src)
-
-    # Content
-    content     = variant_data.get("content", [])
-    why_choose  = html_to_text(get_content_value(content, "whyChoose"))
-    synopsis    = html_to_text(get_content_value(content, "synopsis"))
-    ingredients = html_to_text(get_content_value(content, "ingredients"))
-    directions  = html_to_text(get_content_value(content, "directions"))
-    compliance  = html_to_text(get_content_value(content, "complianceWarnings"))
-
-    short_desc = synopsis or why_choose
-
-    parts = []
-    if why_choose:  parts.append(f"Why It's Cult:\n{why_choose}")
-    if synopsis:    parts.append(synopsis)
-    if ingredients: parts.append(f"Key Ingredients:\n{ingredients}")
-    if directions:  parts.append(f"How to Use:\n{directions}")
-    if compliance:  parts.append(f"Important Information:\n{compliance}")
-    full_desc = "\n\n".join(parts)
-
-    # Stock
-    in_stock = "1"
-    avail = soup.find(id="availabilityMessage")
-    if avail and "out of stock" in avail.get_text(strip=True).lower():
-        in_stock = "0"
-    if variant_data and not variant_data.get("inStock", True):
-        in_stock = "0"
-
-    attr_name, attr_val = extract_variants(variant_data)
-
-    tags_set = set()
-    for seg in category.split(" > "):
-        seg = seg.strip()
-        if seg and seg not in ("Shop All",):
-            tags_set.add(seg)
-    if brand:
-        tags_set.add(brand)
-    tags = ", ".join(sorted(tags_set))
-
-    return {
-        "sku":               sku,
-        "name":              title,
-        "brand":             brand,
-        "price":             price,
-        "category":          category,
-        "tags":              tags,
-        "short_description": short_desc,
-        "description":       full_desc,
-        "images":            "|".join(images[:8]),
-        "in_stock":          in_stock,
-        "attr_name":         attr_name,
-        "attr_val":          attr_val,
-    }
+    dur = probe_duration(out)
+    mb  = os.path.getsize(out) / (1024*1024)
+    logging.info(f"✅ avatar track: {dur:.3f}s  {mb:.1f}MB  ({time.time()-t0:.1f}s)")
+    return out, txt
 
 
-# ── WC row builder ────────────────────────────────────────────────────────────
-def build_wc_row(p: dict) -> dict:
-    row = {col: "" for col in WC_COLUMNS}
-    row["Type"]                        = "simple"
-    row["SKU"]                         = p["sku"]
-    row["Name"]                        = p["name"]
-    row["Published"]                   = "1"
-    row["Is featured?"]                = "0"
-    row["Visibility in catalog"]       = "visible"
-    row["Short description"]           = p["short_description"]
-    row["Description"]                 = p["description"]
-    row["Tax status"]                  = "taxable"
-    row["In stock?"]                   = p["in_stock"]
-    row["Backorders allowed?"]         = "0"
-    row["Sold individually?"]          = "0"
-    row["Allow customer reviews?"]     = "1"
-    row["Regular price"]               = p["price"]
-    row["Categories"]                  = p["category"]
-    row["Tags"]                        = p["tags"]
-    row["Images"]                      = p["images"]
-    row["Brands"]                      = p["brand"]
-    row["Attribute 1 name"]            = "Brand"
-    row["Attribute 1 value(s)"]        = p["brand"]
-    row["Attribute 1 visible"]         = "1"
-    row["Attribute 1 global"]          = "1"
-    if p.get("attr_name") and p.get("attr_val"):
-        row["Attribute 2 name"]        = p["attr_name"]
-        row["Attribute 2 value(s)"]    = p["attr_val"]
-        row["Attribute 2 visible"]     = "1"
-        row["Attribute 2 global"]      = "1"
-    row["Meta: _yoast_wpseo_title"]    = p["name"][:60]
-    row["Meta: _yoast_wpseo_metadesc"] = p["short_description"][:160]
-    return row
+def composite(content_video, avatar_track, layout_config, canvas_w, canvas_h, output_path):
+    """
+    Single-pass NVENC composite.
+    input 0: content video  (anchor + audio)
+    input 1: avatar track   (visual only, from t=0)
+    Background 'blurred' uses content video downscale as BG — no extra input needed.
+    """
+    layout_id  = layout_config.get("layout_id",  "news_broadcast")
+    background = layout_config.get("background", "#0a0a0a")
 
+    # ── geometry ──────────────────────────────────────────────────────────────
+    av_layer        = layout_config.get("avatar_layer")  or {}
+    av_x            = int(av_layer.get("x",      0))
+    av_y            = int(av_layer.get("y",      0))
+    av_w            = int(av_layer.get("width",  320))
+    av_h            = int(av_layer.get("height", 450))
+    av_border       = av_layer.get("border") or {}
+    av_border_w     = max(0, int(av_border.get("width",  0)))
+    av_border_color = av_border.get("color", "#ffffff").lstrip("#")
+    av_border_r     = max(0, int(av_border.get("radius", 0)))
+    if not re.match(r'^[0-9a-fA-F]{6}$', av_border_color):
+        av_border_color = "ffffff"
 
-# ── Worker function (runs in thread pool) ─────────────────────────────────────
-def scrape_product(args: tuple) -> dict | None:
-    """Called by thread pool. Returns parsed product dict or None."""
-    prod_url, fallback_category = args
-    product = parse_product_page(prod_url, fallback_category)
-    if product:
-        log.info(
-            f"  ✓ [{product['sku']}] {product['name'][:50]}"
-            f" | {product['price']}€ | {product['category']}"
-        )
-    else:
-        log.warning(f"  ✗ Failed: {prod_url}")
-    return product
+    ct_layer        = layout_config.get("content_layer") or {}
+    ct_x            = int(ct_layer.get("x",      0))
+    ct_y            = int(ct_layer.get("y",      0))
+    ct_w            = int(ct_layer.get("width",  canvas_w))
+    ct_h            = int(ct_layer.get("height", canvas_h))
+    ct_border       = ct_layer.get("border") or {}
+    ct_border_w     = max(0, int(ct_border.get("width",  0)))
+    ct_border_color = ct_border.get("color", "#ffffff").lstrip("#")
+    ct_border_r     = max(0, int(ct_border.get("radius", 0)))
+    if not re.match(r'^[0-9a-fA-F]{6}$', ct_border_color):
+        ct_border_color = "ffffff"
 
+    # ── scale borders preview → canvas ────────────────────────────────────────
+    scale       = canvas_w / PREVIEW_W
+    av_border_w = max(0, round(av_border_w * scale))
+    av_border_r = max(0, round(av_border_r * scale))
+    ct_border_w = max(0, round(ct_border_w * scale))
+    ct_border_r = max(0, round(ct_border_r * scale))
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    seen_skus: set[str] = set()
-    seen_lock = threading.Lock()
-    rows: list[dict] = []
-
-    log.info(
-        f"Scraping {len(CATEGORY_URLS)} categories | "
-        f"threads={PRODUCT_THREADS} | MAX_PAGES={MAX_PAGES or 'unlimited'}"
+    logging.info(
+        f"🖼️  layout={layout_id}  bg={background}  canvas={canvas_w}x{canvas_h}\n"
+        f"   content : ({ct_x},{ct_y}) {ct_w}x{ct_h}  border={ct_border_w}px\n"
+        f"   avatar  : ({av_x},{av_y}) {av_w}x{av_h}  border={av_border_w}px"
     )
 
-    for cat_url, cat_label in CATEGORY_URLS:
-        log.info(f"\n{'='*60}\nCATEGORY: {cat_label}\n{cat_url}")
-        page_url  = cat_url
-        page_num  = 0
-        cat_count = 0
+    # ── filter graph ──────────────────────────────────────────────────────────
+    # input 0 : content video
+    # input 1 : avatar track
+    # (no input 2 — blurred BG is derived from input 0, no extra file)
+    parts   = []
+    current = "base"
 
-        while page_url:
-            page_num += 1
-            if MAX_PAGES and page_num > MAX_PAGES:
-                log.info(f"MAX_PAGES={MAX_PAGES} reached, next category")
-                break
+    if background == "blurred":
+        # Derive blurred background from the content video itself.
+        # Downscale to 1/8 then upscale back — fast CPU blur approximation.
+        # Same technique as original production code.
+        parts.append(
+            f"[0:v]"
+            f"scale={canvas_w//8}:{canvas_h//8}:flags=bilinear,"
+            f"scale={canvas_w}:{canvas_h}:flags=bilinear,"
+            f"setsar=1,format=yuv420p[base]"
+        )
+    elif re.match(r'^#[0-9a-fA-F]{6}$', str(background)):
+        bg_color = background.lstrip("#")
+        parts.append(
+            f"color=c=#{bg_color}:s={canvas_w}x{canvas_h}:r=30,"
+            f"format=yuv420p[base]"
+        )
+    else:
+        parts.append(
+            f"color=c=#0a0a0a:s={canvas_w}x{canvas_h}:r=30,"
+            f"format=yuv420p[base]"
+        )
 
-            log.info(f"  [Page {page_num}] {page_url}")
-            # PLP page fetched on the main thread
-            soup = get(page_url)
-            if not soup:
-                break
+    # Content layer
+    if ct_layer and layout_id != "full_avatar":
+        parts.append(
+            f"[0:v]scale={ct_w}:{ct_h}:flags=lanczos,"
+            f"setsar=1,format=yuv420p[ct]"
+        )
+        parts.append(
+            f"[{current}][ct]overlay=x={ct_x}:y={ct_y}:format=yuv420[after_ct]"
+        )
+        current = "after_ct"
+        if ct_border_w > 0:
+            parts.append(
+                f"[{current}]"
+                f"{drawbox(ct_x,ct_y,ct_w,ct_h,ct_border_w,ct_border_color,ct_border_r)}"
+                f"[after_ct_border]"
+            )
+            current = "after_ct_border"
+    elif layout_id == "full_avatar":
+        parts.append(
+            f"[0:v]scale={canvas_w}:{canvas_h}:flags=lanczos,"
+            f"setsar=1,format=yuv420p[base_full]"
+        )
+        current = "base_full"
 
-            bc       = parse_breadcrumbs(soup)
-            fallback = bc if bc else cat_label
-            links    = get_product_links(soup)
-            log.info(f"  Found {len(links)} product links")
+    # Avatar overlay
+    sw = canvas_w if layout_id == "full_avatar" else av_w
+    sh = canvas_h if layout_id == "full_avatar" else av_h
+    ox = 0        if layout_id == "full_avatar" else av_x
+    oy = 0        if layout_id == "full_avatar" else av_y
 
-            if not links:
-                log.warning("  No products — end of list or unexpected page type")
-                break
+    parts.append(
+        f"[1:v]scale={sw}:{sh}:flags=lanczos,"
+        f"setsar=1,format=yuv420p[av]"
+    )
+    parts.append(
+        f"[{current}][av]overlay=x={ox}:y={oy}:format=yuv420[after_av]"
+    )
+    current = "after_av"
 
-            # Filter out already-seen SKUs before dispatching to thread pool
-            new_links = []
-            for prod_url in links:
-                sku = extract_sku(prod_url) or prod_url
-                with seen_lock:
-                    if sku not in seen_skus:
-                        seen_skus.add(sku)
-                        new_links.append((prod_url, fallback))
+    # Avatar border
+    if av_border_w > 0 and layout_id not in ("full_avatar", "full_content"):
+        parts.append(
+            f"[{current}]"
+            f"{drawbox(av_x,av_y,av_w,av_h,av_border_w,av_border_color,av_border_r)}"
+            f"[after_av_border]"
+        )
+        current = "after_av_border"
 
-            log.info(f"  Dispatching {len(new_links)} new products to {PRODUCT_THREADS} threads")
+    filter_complex = ";".join(parts)
+    logging.info(f"🔧 filter_complex ({len(filter_complex)} chars):\n{filter_complex}\n")
 
-            # Scrape product pages in parallel
-            with ThreadPoolExecutor(
-                max_workers=PRODUCT_THREADS,
-                thread_name_prefix="Worker"
-            ) as executor:
-                futures = {executor.submit(scrape_product, args): args for args in new_links}
-                for future in as_completed(futures):
-                    try:
-                        product = future.result()
-                        if product:
-                            rows.append(build_wc_row(product))
-                            cat_count += 1
-                    except Exception as exc:
-                        log.error(f"  Thread error: {exc}")
+    cmd = [
+        "ffmpeg", "-y",
+        "-hwaccel", "cuda", "-i", content_video,
+        "-hwaccel", "cuda", "-i", avatar_track,
+        "-filter_complex", filter_complex,
+        "-map",       f"[{current}]",
+        "-map",       "0:a",
+        "-shortest",
+        "-c:v",       "h264_nvenc",
+        "-preset",    "p4",
+        "-rc",        "constqp",
+        "-qp",        "18",
+        "-profile:v", "high",
+        "-pix_fmt",   "yuv420p",
+        "-c:a",       "copy",
+        "-movflags",  "+faststart",
+        output_path,
+    ]
 
-            page_url = get_next_page(soup)
+    logging.info("🚀 single-pass NVENC composite …")
+    t0     = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    el     = time.time() - t0
 
-        log.info(f"  → {cat_count} new products from {cat_label}")
+    if result.returncode != 0 or not os.path.exists(output_path):
+        logging.error(f"❌ failed ({el:.1f}s):\n{result.stderr[-1500:]}")
+        return None
 
-    # Write CSV — done on main thread after all scraping complete
-    with open(OUTPUT, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=WC_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    content_dur = probe_duration(content_video)
+    out_dur     = probe_duration(output_path)
+    mb          = os.path.getsize(output_path) / (1024*1024)
 
-    log.info(f"\n{'='*60}")
-    log.info(f"✅ DONE: {len(rows)} products saved to {OUTPUT}")
-    log.info(f"   Unique SKUs: {len(seen_skus)}")
+    logging.info("")
+    logging.info("=" * 55)
+    logging.info("🎉 DONE")
+    logging.info(f"   output  : {output_path}")
+    logging.info(f"   size    : {mb:.1f} MB")
+    logging.info(f"   time    : {el:.1f}s  ({el/60:.1f} min)")
+    logging.info(f"   content : {content_dur:.3f}s")
+    logging.info(f"   output  : {out_dur:.3f}s")
+    logging.info(f"   delta   : {out_dur - content_dur:+.3f}s  ← target 0.000s")
+    logging.info("=" * 55)
+
+    return output_path
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tmp_dir = os.path.join(OUT_DIR, f"_tmp_{int(time.time())}")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    for label, path in [
+        ("content", CONTENT_VIDEO),
+        ("avatar0", AVATAR_0),
+        ("avatar1", AVATAR_1),
+    ]:
+        if not os.path.exists(path):
+            logging.error(f"❌ missing {label}: {path}")
+            return
+
+    content_dur = probe_duration(CONTENT_VIDEO)
+    av0_dur     = probe_duration(AVATAR_0)
+    av1_dur     = probe_duration(AVATAR_1)
+    av_total    = av0_dur + av1_dur
+
+    logging.info(f"📹 content    : {content_dur:.3f}s")
+    logging.info(f"🎭 avatar0    : {av0_dur:.3f}s")
+    logging.info(f"🎭 avatar1    : {av1_dur:.3f}s")
+    logging.info(f"🎭 av total   : {av_total:.3f}s")
+    logging.info(f"   delta      : {av_total - content_dur:+.3f}s")
+    logging.info(f"\n📐 Layout     : {LAYOUT_CONFIG['layout_id']}")
+    logging.info(f"   background : {LAYOUT_CONFIG['background']}")
+    logging.info(
+        f"   content    : ({LAYOUT_CONFIG['content_layer']['x']},"
+        f"{LAYOUT_CONFIG['content_layer']['y']}) "
+        f"{LAYOUT_CONFIG['content_layer']['width']}x"
+        f"{LAYOUT_CONFIG['content_layer']['height']}"
+    )
+    logging.info(
+        f"   avatar     : ({LAYOUT_CONFIG['avatar_layer']['x']},"
+        f"{LAYOUT_CONFIG['avatar_layer']['y']}) "
+        f"{LAYOUT_CONFIG['avatar_layer']['width']}x"
+        f"{LAYOUT_CONFIG['avatar_layer']['height']}"
+    )
+
+    # step 1: concat avatar batches → one continuous track
+    logging.info("\n▶ step 1 — concat avatar batches …")
+    result = concat_avatars([AVATAR_0, AVATAR_1], tmp_dir)
+    if not result:
+        return
+    avatar_track, concat_txt = result
+
+    # step 2: composite
+    logging.info("\n▶ step 2 — composite …")
+    output_path = os.path.join(
+        OUT_DIR,
+        f"composite_news_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    )
+
+    out = composite(
+        content_video = CONTENT_VIDEO,
+        avatar_track  = avatar_track,
+        layout_config = LAYOUT_CONFIG,
+        canvas_w      = CANVAS_W,
+        canvas_h      = CANVAS_H,
+        output_path   = output_path,
+    )
+
+    # cleanup
+    try: os.remove(avatar_track)
+    except: pass
+    try: os.remove(concat_txt)
+    except: pass
+    try: os.rmdir(tmp_dir)
+    except: pass
+
+    if out:
+        logging.info(f"\n🎉 SUCCESS → {out}")
+    else:
+        logging.error("\n💥 FAILED")
 
 
 if __name__ == "__main__":

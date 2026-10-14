@@ -1,160 +1,300 @@
+#!/usr/bin/env python3
+"""
+Delete videos older than N days from `outputs/` and MongoDB.
+
+Usage (from backend root, same folder as app.py / .env):
+    python cleanup_old_videos.py              # dry-run, 7 days
+    python cleanup_old_videos.py --apply        # actually delete
+    python cleanup_old_videos.py --apply --yes  # skip confirmation
+    python cleanup_old_videos.py --outputs-only --apply --yes  # disk only, fast
+
+Uses mongodb.mongo_instance when available (same as app.py), else MONGODB_URI / MONGO_URI.
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import time
-import shutil
-import logging
-from datetime import datetime, timedelta
-import schedule
-from threading import Thread
-from mongodb import mongo_instance  # Assuming you're using the same mongodb connection
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+try:
+    import env_loader  # noqa: F401
+except ImportError:
+    pass
 
-# Configuration
-TEMP_VIDEO_DATA_STORAGE = "temp_video_data_storage"  # Path to temp storage folder
-OUTPUTS_FOLDER = "outputs"  # Path to outputs folder
-MAX_AGE_DAYS = 7  # Files older than this will be deleted
 
-def cleanup_temp_files():
-    """Delete files in temp_video_data_storage older than MAX_AGE_DAYS"""
-    now = time.time()
-    max_age_seconds = MAX_AGE_DAYS * 24 * 60 * 60  # Convert days to seconds
-    
-    if not os.path.exists(TEMP_VIDEO_DATA_STORAGE):
-        logging.warning(f"Temp directory {TEMP_VIDEO_DATA_STORAGE} does not exist")
-        return
-    
-    deleted_count = 0
-    error_count = 0
-    
-    logging.info(f"Starting cleanup of files older than {MAX_AGE_DAYS} days in {TEMP_VIDEO_DATA_STORAGE}")
-    
-    for item in os.listdir(TEMP_VIDEO_DATA_STORAGE):
-        item_path = os.path.join(TEMP_VIDEO_DATA_STORAGE, item)
-        
-        # Get the last modification time
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_created_at(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str):
         try:
-            item_age = now - os.path.getmtime(item_path)
-            
-            # Check if the file/folder is older than MAX_AGE_DAYS
-            if item_age > max_age_seconds:
-                try:
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                    elif os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                    deleted_count += 1
-                    logging.info(f"Deleted: {item_path}")
-                except Exception as e:
-                    logging.error(f"Error deleting {item_path}: {str(e)}")
-                    error_count += 1
-        except Exception as e:
-            logging.error(f"Error checking age of {item_path}: {str(e)}")
-            error_count += 1
-    
-    logging.info(f"Temp files cleanup complete: {deleted_count} items deleted, {error_count} errors")
+            s = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        except ValueError:
+            return None
+    return None
 
-def cleanup_output_videos():
-    """Delete video files in outputs folder older than MAX_AGE_DAYS"""
-    now = time.time()
-    max_age_seconds = MAX_AGE_DAYS * 24 * 60 * 60
-    
-    if not os.path.exists(OUTPUTS_FOLDER):
-        logging.warning(f"Outputs directory {OUTPUTS_FOLDER} does not exist")
-        return
-    
-    deleted_count = 0
-    error_count = 0
-    
-    logging.info(f"Starting cleanup of videos older than {MAX_AGE_DAYS} days in {OUTPUTS_FOLDER}")
-    
-    for item in os.listdir(OUTPUTS_FOLDER):
-        item_path = os.path.join(OUTPUTS_FOLDER, item)
-        
-        # Skip if not a file
-        if not os.path.isfile(item_path):
-            continue
-            
-        # Check if it's a video file (basic check for common video extensions)
-        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv']
-        if not any(item.lower().endswith(ext) for ext in video_extensions):
-            continue
-        
-        try:
-            item_age = now - os.path.getmtime(item_path)
-            
-            if item_age > max_age_seconds:
-                try:
-                    os.remove(item_path)
-                    deleted_count += 1
-                    logging.info(f"Deleted: {item_path}")
-                except Exception as e:
-                    logging.error(f"Error deleting {item_path}: {str(e)}")
-                    error_count += 1
-        except Exception as e:
-            logging.error(f"Error checking age of {item_path}: {str(e)}")
-            error_count += 1
-    
-    logging.info(f"Output videos cleanup complete: {deleted_count} videos deleted, {error_count} errors")
 
-def cleanup_completed_videos_db():
-    """Delete documents in completed_videos collection older than MAX_AGE_DAYS"""
+def _get_db():
     try:
-        db = mongo_instance.get_db()
-        collection = db.completed_videos
-        
-        # Calculate the cutoff date (3 days ago)
-        cutoff_date = datetime.now() - timedelta(days=MAX_AGE_DAYS)
-        
-        # Delete documents older than cutoff date
-        # Assuming there's a 'created_at' or similar timestamp field
-        # Adjust the field name as needed for your database schema
-        result = collection.delete_many({"created_at": {"$lt": cutoff_date}})
-        
-        logging.info(f"Database cleanup complete: {result.deleted_count} documents deleted from completed_videos")
-    except Exception as e:
-        logging.error(f"Error cleaning up database: {str(e)}")
+        from mongodb import mongo_instance
 
-def run_cleanup():
-    """Run all cleanup functions"""
-    logging.info("Starting scheduled cleanup task")
-    cleanup_temp_files()
-    cleanup_output_videos()
-    cleanup_completed_videos_db()
-    logging.info("Scheduled cleanup task completed")
+        return mongo_instance.get_db()
+    except Exception as exc:
+        uri = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI")
+        if not uri:
+            raise RuntimeError(
+                "Could not import mongodb.mongo_instance and no MONGODB_URI/MONGO_URI set."
+            ) from exc
+        from pymongo import MongoClient
 
-def start_cleanup_scheduler():
-    """Start the cleanup scheduler in a background thread"""
-    def run_scheduler():
-        # Run once at startup
-        run_cleanup()
-        
-        # Schedule to run daily at midnight
-        schedule.every().day.at("00:00").do(run_cleanup)
-        
-        while True:
+        db_name = os.getenv("MONGODB_DB") or os.getenv("MONGO_DB_NAME") or "alchemy"
+        return MongoClient(uri, serverSelectionTimeoutMS=15000)[db_name]
+
+
+def _outputs_dir() -> Path:
+    raw = os.getenv("OUTPUT_FOLDER") or os.getenv("OUTPUT_DIR") or "outputs"
+    return Path(raw).resolve()
+
+
+def _age_query(cutoff: datetime):
+    """Match by created_at OR legacy docs with only ObjectId timestamp."""
+    from bson import ObjectId
+
+    cutoff_oid = ObjectId.from_datetime(
+        cutoff.replace(tzinfo=timezone.utc) if cutoff.tzinfo is None else cutoff
+    )
+    return {
+        "$or": [
+            {"created_at": {"$lt": cutoff}},
+            {"created_at": {"$exists": False}, "_id": {"$lt": cutoff_oid}},
+            {"created_at": None, "_id": {"$lt": cutoff_oid}},
+        ]
+    }
+
+
+def _collect_db_video_paths(doc: dict) -> set[str]:
+    names: set[str] = set()
+    for key in ("video_path", "intro_path", "body_path", "final_path"):
+        val = doc.get(key)
+        if isinstance(val, str) and val.strip():
+            names.add(os.path.basename(val.strip()))
+    return names
+
+
+def _scan_outputs(outputs: Path, cutoff: datetime, *, apply: bool) -> tuple[int, int]:
+    video_ext = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+    deleted = 0
+    scanned = 0
+
+    if not outputs.is_dir():
+        _log(f"\nWARNING: outputs folder does not exist: {outputs}")
+        return 0, 0
+
+    _log(f"\nScanning {outputs} ...")
+    for path in outputs.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in video_ext:
+            continue
+        scanned += 1
+        if scanned % 100 == 0:
+            _log(f"  ... scanned {scanned} video files")
+
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).replace(
+            tzinfo=None
+        )
+        if mtime >= cutoff:
+            continue
+
+        if apply:
             try:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
-            except Exception as e:
-                logging.error(f"Scheduler error: {str(e)}")
-                time.sleep(300)  # Wait 5 minutes before retrying after an error
-    
-    # Start scheduler in a separate thread
-    Thread(target=run_scheduler, daemon=True).start()
-    logging.info("🧹 Cleanup scheduler started")
+                path.unlink()
+                deleted += 1
+            except OSError as exc:
+                _log(f"  ! could not delete {path.name}: {exc}")
+        else:
+            deleted += 1  # count as "would delete" in dry-run
+
+    return scanned, deleted
+
+
+def _cleanup_collection(
+    db,
+    collection_name: str,
+    query: dict,
+    projection: dict,
+    *,
+    apply: bool,
+    sample: int = 10,
+    extra_label: str = "",
+) -> tuple[int, set[str]]:
+    col = db[collection_name]
+    _log(f"\nQuerying {collection_name}{extra_label} ...")
+
+    try:
+        count = col.count_documents(query)
+    except Exception as exc:
+        _log(f"  ! count failed: {exc}")
+        return 0, set()
+
+    _log(f"  matched: {count}")
+    if count == 0:
+        return 0, set()
+
+    video_names: set[str] = set()
+    shown = 0
+    cursor = col.find(query, projection).batch_size(200)
+
+    for doc in cursor:
+        video_names.update(_collect_db_video_paths(doc))
+        if shown < sample:
+            created = _parse_created_at(doc.get("created_at"))
+            title = (doc.get("title") or doc.get("status") or "")[:60]
+            _log(f"  - {doc.get('_id')} | {created} | {title!r}")
+            shown += 1
+
+    if count > sample:
+        _log(f"  ... and {count - sample} more")
+
+    if apply and count > 0:
+        _log(f"  deleting {count} row(s) from {collection_name} ...")
+        result = col.delete_many(query)
+        _log(f"  deleted: {result.deleted_count}")
+
+    return count, video_names
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Remove videos older than N days from outputs/ and MongoDB."
+    )
+    parser.add_argument("--days", type=int, default=7, help="Age threshold (default: 7)")
+    parser.add_argument("--apply", action="store_true", help="Actually delete")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation with --apply")
+    parser.add_argument(
+        "--outputs-only",
+        action="store_true",
+        help="Only delete old files in outputs/ (skip MongoDB)",
+    )
+    args = parser.parse_args()
+
+    if args.days < 1:
+        _log("ERROR: --days must be >= 1")
+        return 1
+
+    cutoff = _utcnow() - timedelta(days=args.days)
+    outputs = _outputs_dir()
+    mode = "APPLY" if args.apply else "DRY-RUN"
+
+    _log(f"=== Video cleanup ({mode}) ===")
+    _log(f"Cutoff: {cutoff.isoformat()} UTC (older than {args.days} day(s))")
+    _log(f"Outputs folder: {outputs}")
+    _log("")
+
+    if args.apply and not args.yes:
+        answer = input("Type yes to permanently delete old videos: ").strip().lower()
+        if answer not in ("yes", "y"):
+            _log("Aborted.")
+            return 0
+
+    files_from_db: set[str] = set()
+    stats = {
+        "completed_videos_db": 0,
+        "video_data_db": 0,
+        "dreamface_jobs_db": 0,
+        "outputs_scanned": 0,
+        "outputs_deleted": 0,
+        "db_files_deleted": 0,
+    }
+
+    if not args.outputs_only:
+        _log("Connecting to MongoDB ...")
+        db = _get_db()
+        _log("Connected.")
+
+        age_q = _age_query(cutoff)
+        cv_projection = {"title": 1, "created_at": 1, "video_path": 1, "intro_path": 1, "body_path": 1, "final_path": 1}
+
+        n, names = _cleanup_collection(
+            db, "completed_videos", age_q, cv_projection, apply=args.apply
+        )
+        stats["completed_videos_db"] = n
+        files_from_db.update(names)
+
+        vd_query = {
+            **age_q,
+            "status": {"$in": ["completed", "failed", "processing", "awaiting_dreamface"]},
+        }
+        n, _ = _cleanup_collection(
+            db,
+            "video_data",
+            vd_query,
+            {"title": 1, "created_at": 1, "status": 1},
+            apply=args.apply,
+            extra_label=" (non-draft)",
+        )
+        stats["video_data_db"] = n
+
+        n, _ = _cleanup_collection(
+            db,
+            "dreamface_jobs",
+            age_q,
+            {"created_at": 1, "status": 1, "user_id": 1},
+            apply=args.apply,
+        )
+        stats["dreamface_jobs_db"] = n
+
+        if files_from_db:
+            _log(f"\nDeleting {len(files_from_db)} file(s) referenced in DB ...")
+            for name in sorted(files_from_db):
+                path = outputs / name
+                if not path.is_file():
+                    continue
+                if args.apply:
+                    try:
+                        path.unlink()
+                        stats["db_files_deleted"] += 1
+                    except OSError as exc:
+                        _log(f"  ! {name}: {exc}")
+                else:
+                    stats["db_files_deleted"] += 1
+                    _log(f"  would delete: {path}")
+
+    scanned, deleted = _scan_outputs(outputs, cutoff, apply=args.apply)
+    stats["outputs_scanned"] = scanned
+    stats["outputs_deleted"] = deleted
+
+    _log("")
+    _log("=== Summary ===")
+    if not args.outputs_only:
+        _log(f"  completed_videos removed: {stats['completed_videos_db']}")
+        _log(f"  video_data removed:       {stats['video_data_db']}")
+        _log(f"  dreamface_jobs removed:   {stats['dreamface_jobs_db']}")
+        _log(f"  DB-linked files removed:  {stats['db_files_deleted']}")
+    _log(f"  outputs scanned:          {stats['outputs_scanned']}")
+    if args.apply:
+        _log(f"  outputs files deleted:    {stats['outputs_deleted']}")
+    else:
+        _log(f"  outputs files to delete:  {stats['outputs_deleted']}")
+        _log("  (dry-run — use --apply to delete for real)")
+
+    _log("Done.")
+    return 0
+
 
 if __name__ == "__main__":
-    logging.info("Starting cleanup service")
-    start_cleanup_scheduler()  # 🔁 This runs cleanup now + schedules daily tasks
-
-    # Keep the script alive
-    while True:
-        time.sleep(60)
-
-    
-    # Uncomment to run as a continuous service with daily scheduling
-    # start_cleanup_scheduler()
+    raise SystemExit(main())

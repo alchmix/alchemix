@@ -1,70 +1,101 @@
-# Python virtual environments
+# ============================================================
+# Secrets / credentials  (never commit these)
+# ============================================================
+.env
+*.env
+cookies.json
+cookies_chrome.txt
+cookies_header_chrome.txt
+google_cookie.txt
+imagefx_all_cookies.json
+imagefx_cookies.json
+imagefx_cookies_string.txt
+
+# ============================================================
+# Large / binary media & model files (contents omitted)
+# ============================================================
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.npy
+*.npz
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.csv
+
+# Large one-off files in the project root
+/bg_strip.png
+/avatar.png
+/cache_*.png
+/depth*.png
+/mask_*.png
+/imgg*.png
+/script.txt
+
+# Logs, pid files, signals
+*.log
+*.pid
+*.signal
+
+
+# ============================================================
+# Data / working folders: keep the folder structure (via
+# .gitkeep files) but ignore everything inside them
+# ============================================================
+.parallax_cache/**
+background_music/**
+bg_static/**
+cache/**
+channel_media/**
+character_uploads/**
+cookies/**
+dream/**
+edit_uploads/**
+explainer/**
+imagefx_images/**
+job_payloads/**
+narration_segments/**
+nltk_data/**
+output/**
+outputs/**
+overlay_cache/**
+pexels_images/**
+pexels_videos/**
+qwen/**
+sounds/**
+static/**
+temp_audio/**
+temp_video_data_storage/**
+test_audio/**
+test_download_pexels/**
+test_downloads/**
+test_output/**
+test_pexels/**
+timeline_work/**
+tmp/**
+uploads/**
+verify_out/**
+vids/**
+voices/**
+whisk_outputs/**
+whisk_uploads/**
+whoosh_cache/**
+yt_demo_out/**
+helper/tempstatic/**
+
+# Re-include sub-directories and the .gitkeep placeholders
+!*/
+!**/.gitkeep
+
+# Must come AFTER the re-include rule above
+__pycache__/
+*.pyc
 .venv/
 venv/
-
-# Node modules
 node_modules/
-
-# Environment files
-.env
-
-# Video/audio outputs
-*.mp4
-*.wav
-
-# Project directories to ignore
-bg_static/
-background_music/
-channel_media/
-character_uploads/
-dream/
-edit_uploads/
-output/
-outputs/
-pexels_images/
-pexels_videos/
-static/
-test_pexels/
-verify_out/
-vids/
-voices/
-whisk_outputs/
-whisk_uploads/
-whoosh_cache/
-imagefx_images/
-narration_segments/
-nltk_data/
-overlay_cache/
-sounds/
-qwen/
-temp_audio/
-temp_video_data_storage/
-test_audio/
-test_download_pexels/
-test_downloads/
-tmp/
-
-# Specific fallback / GPU / parallax / test videos (optional, already covered by *.mp4)
-# /fallback_seg_2_24ce71b3TEMP_MPY_wvf_snd.mp4
-# /fallback_seg_2_61120845TEMP_MPY_wvf_snd.mp4
-# /fallback_seg_5_ecd8d111TEMP_MPY_wvf_snd.mp4
-# /final_20251201_031654.mp4
-# /gpu_render_5859.mp4
-# /gpu_render_6039.mp4
-# /gpu_render_8806.mp4
-# /gpu_render_9847.mp4
-# /parallax_epic.mp4
-# /parallax_fast.mp4
-# /parallax_output.mp4
-# /professional_parallax.mp4
-# /professional_slideshow.mp4
-# /test_output.mp4
-# /test_pan_left.mp4
-# /test_pan_right.mp4
-# /test_qwen.wav
-# /test_range.mp4
-# /test_segmenttmp4.mp4
-# /test_transition_output.mp4
-# /test_zoom_in.mp4
-# /test_zoom_out.mp4
-# /Video Project.mp4
