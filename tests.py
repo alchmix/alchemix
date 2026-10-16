@@ -16129,16 +16129,123 @@ def _extract_layout_geometry(layout_config, canvas_w, canvas_h):
     }
 
 
-def _fetch_bg_media(url, suffix, chunk_folder):
-    import urllib.request
+def _bg_normalize_url(url):
+    """'api.example.com/static/x.mp4' or '//host/x' → full https URL (urllib/requests need a scheme)."""
+    import re as _re
+
+    u = str(url or "").strip()
+    if u.startswith("//"):
+        return "https:" + u
+    if not _re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u) and _re.match(r"^[a-z0-9][-a-z0-9.]*\.[a-z]{2,}(:\d+)?/", u, _re.I):
+        return "https://" + u
+    return u
+
+
+def _bg_local_candidates(url):
+    """Files on THIS machine that a /static/... background URL points to."""
+    from urllib.parse import urlparse, unquote
+
+    path = unquote(urlparse(str(url)).path or str(url)).replace("\\", "/")
+    i = path.find("static/")
+    if i < 0:
+        return []
+    rel = path[i:]                      # static/uploads/dreamface/backgrounds/x.mp4
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [os.getcwd(), here, os.path.dirname(here)]
+    out = [os.path.join(r, *rel.split("/")) for r in roots]
+    static_root = os.getenv("STATIC_ROOT")
+    if static_root:
+        out.append(os.path.join(static_root, *rel.split("/")[1:]))
+    up = os.getenv("DREAMFACE_BG_UPLOAD_DIR")
+    if up:
+        out.append(os.path.join(up, os.path.basename(rel)))
+    return out
+
+
+def _bg_media_ok(path):
+    """True when ffprobe finds a decodable picture in the file."""
     try:
-        tmp = tempfile.NamedTemporaryFile(
-            delete=False, suffix=suffix, dir=chunk_folder
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type,width,height", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60,
         )
-        urllib.request.urlretrieve(url, tmp.name)
-        return tmp.name
+        return r.returncode == 0 and "video" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _fetch_bg_media(url, suffix, chunk_folder):
+    """
+    Get the canvas background image / video for ffmpeg. Returns a private copy
+    in chunk_folder (callers delete it) or None.
+
+    1. The upload lives on this machine (static/uploads/...) → use that file,
+       no HTTP at all (PUBLIC_BASE_URL may be localhost or a CDN/proxy that
+       refuses Python's default user agent — that used to give a black bg).
+    2. Otherwise download it once per job (browser user agent, timeout, status
+       check) and reuse the cached copy for every chunk.
+    3. Never hand ffmpeg a file it cannot read — log loudly and return None.
+    """
+    import hashlib
+    import shutil
+
+    if not url:
+        return None
+    url = _bg_normalize_url(url)
+    ext = os.path.splitext(str(url).split("?")[0])[1].lower() or suffix
+    if len(ext) > 6:
+        ext = suffix
+    key = hashlib.md5(str(url).encode("utf-8")).hexdigest()[:12]
+    cache = os.path.join(chunk_folder, f"bgcache_{key}{ext}")
+
+    if not (os.path.exists(cache) and os.path.getsize(cache) > 0):
+        src = next((c for c in _bg_local_candidates(url) if os.path.isfile(c) and os.path.getsize(c) > 0), None)
+        try:
+            if src:
+                shutil.copyfile(src, cache)
+                logging.info(f"🖼️  BG media from local file: {src}")
+            else:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                    "Accept": "*/*",
+                }
+                with requests.get(url, headers=headers, stream=True, timeout=(15, 180)) as r:
+                    r.raise_for_status()
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    if "text/html" in ctype:
+                        raise ValueError(f"server returned a web page ({ctype}), not media")
+                    tmp_dl = cache + ".part"
+                    with open(tmp_dl, "wb") as fh:
+                        for block in r.iter_content(1 << 20):
+                            if block:
+                                fh.write(block)
+                    os.replace(tmp_dl, cache)
+                logging.info(f"🖼️  BG media downloaded: {url} ({os.path.getsize(cache) / 1e6:.1f} MB)")
+        except Exception as e:
+            logging.error(
+                f"❌ BG fetch failed — background will be plain dark: {url} | {e}\n"
+                f"   (checked local: {_bg_local_candidates(url)[:3]}) — make sure PUBLIC_BASE_URL "
+                f"points at this server or the file is reachable"
+            )
+            return None
+        if not _bg_media_ok(cache):
+            logging.error(f"❌ BG media is not a readable image/video: {url} — background will be plain dark")
+            try:
+                os.remove(cache)
+            except OSError:
+                pass
+            return None
+
+    try:
+        out = os.path.join(chunk_folder, f"bg_{key}_{uuid.uuid4().hex[:8]}{ext}")
+        shutil.copyfile(cache, out)
+        return out
     except Exception as e:
-        logging.warning(f"⚠️  BG fetch failed: {e}")
+        logging.error(f"❌ BG media copy failed: {e}")
         return None
 
 # ════════════════════════════════════════════════════════════════════════
