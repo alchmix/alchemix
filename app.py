@@ -2180,7 +2180,7 @@ def upload_file():
         # Build absolute URL using request context
         public_base = os.getenv("PUBLIC_BASE_URL")
         if public_base:
-            base = public_base.rstrip('/')
+            base = _public_base_url()
         else:
             # Use the current request's host
             base = request.host_url.rstrip('/')
@@ -4012,6 +4012,16 @@ def clip_stream_preview():
     return resp
 
 
+def _public_base_url(default="http://localhost:5000"):
+    """PUBLIC_BASE_URL with a scheme ('api.example.com' → 'https://api.example.com')."""
+    base = (os.getenv("PUBLIC_BASE_URL") or default or "").strip().rstrip("/")
+    if base.startswith("//"):
+        base = "https:" + base
+    elif base and "://" not in base:
+        base = "https://" + base
+    return base
+
+
 @app.route("/api/dreamface/upload-background", methods=["POST"])
 @jwt_required()
 def upload_dreamface_background():
@@ -4046,7 +4056,7 @@ def upload_dreamface_background():
     save_path = os.path.join(upload_dir, filename)
     file.save(save_path)
 
-    base = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
+    base = _public_base_url()
     url = f"{base}/{upload_dir.replace(os.sep, '/')}/{filename}"
 
     logging.info(f"✅ DreamFace background uploaded | user={user} | {filename}")
@@ -4260,7 +4270,7 @@ def upload_composition_image():
     save_path = os.path.join(UPLOAD_DIR, filename)
     file.save(save_path)
 
-    base = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
+    base = _public_base_url()
     url = f"{base}/{UPLOAD_DIR.replace(os.sep, '/')}/{filename}"
 
     return jsonify({"url": url}), 200
