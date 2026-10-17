@@ -89,6 +89,10 @@ app.register_blueprint(speechify_bp)
 from cartesia_routes import cartesia_bp
 app.register_blueprint(cartesia_bp)
 
+# Visual Engine (documentary videos) — a separate service on this machine; see docs/VISUAL_ENGINE.md
+from visual_engine_routes import visual_engine_bp
+app.register_blueprint(visual_engine_bp)
+
 # Upload Folder
 UPLOAD_FOLDER = "./static"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -467,15 +471,21 @@ def get_news():
 
 
 @app.route('/api/register', methods=['POST'])
+@jwt_required()  # accounts are created from the Sign-up page by a logged-in team member, never anonymously
 def register():
     email = request.json.get('email', None)
     firstName = request.json.get('firstName', None)
     lastName=request.json.get('lastName',None)
     password = request.json.get('password', None)
-    status=request.json.get('status',None)
+    status = (request.json.get('status') or 'user').strip().lower()
+    if status not in ('user', 'admin'):
+        return jsonify({"error": "Status must be user or admin"}), 400
+    # Only an admin may create another admin (before this, anyone could POST status "admin" without logging in).
+    if status == 'admin' and not _is_admin():
+        return jsonify({"error": "Only an admin can create an administrator account"}), 403
 
-    if not email or not password or not status or not firstName or not lastName:
-        return jsonify({"error": "Email, name, status and password  are required"}), 400
+    if not email or not password or not firstName or not lastName:
+        return jsonify({"error": "Email, name and password are required"}), 400
     
     
     userExists=db.users.find_one({"email":email})
@@ -1617,7 +1627,7 @@ def update_imagefx_cookies():
 
 
 @app.route("/api/completed-videos/cleanup", methods=["DELETE"])
-# @jwt_required()
+@admin_required  # was open to anyone on the internet (deletes every user's records older than 10 days)
 def cleanup_completed_videos():
     # Calculate cutoff: 10 days ago from now (UTC)
     ten_days_ago = datetime.utcnow() - timedelta(days=10)
