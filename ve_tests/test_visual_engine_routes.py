@@ -350,3 +350,17 @@ def test_brand_kit_motion_is_saved_and_sent(env):
     env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel,
                                                   "voice": "liam"}, headers=auth(env))
     assert env.fake.calls[-1].json["motion"] == {"tempo": ["brisk"], "reveal": ["type", "decode"]}
+
+
+def test_timeline_routes_pass_through(env):
+    _job(env, status="completed", result={"video_file": "ve_1.mp4", "publish": "shared", "project_path": "/x/p.json"})
+    v = env.c.get("/api/visual-engine/videos/ve_1", headers=auth(env)).get_json()["video"]
+    assert v["result"]["has_timeline"] is True and "project_path" not in v["result"]
+    env.fake.answers[("GET", "/v1/videos/ve_1/timeline")] = (200, {"duration": 12.0, "items": []})
+    assert env.c.get("/api/visual-engine/videos/ve_1/timeline", headers=auth(env)).get_json()["duration"] == 12.0
+    r = env.c.get("/api/visual-engine/videos/ve_1/thumb?scene=b0_s0&evil=1", headers=auth(env))
+    assert r.status_code == 200 and r.mimetype == "image/jpeg"
+    edits = [{"type": "set", "scene_id": "b0_s0", "composition": 0, "layer_id": "t", "path": "data.text",
+              "value": "Hi"}]
+    r = env.c.post("/api/visual-engine/videos/ve_1/edits", json={"edits": edits, "junk": 1}, headers=auth(env))
+    assert r.status_code == 200 and env.fake.calls[-1].json == {"edits": edits}

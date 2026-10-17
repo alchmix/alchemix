@@ -18,6 +18,9 @@ and Telegram notices.
            missing fields come from the channel's brand kit; header Idempotency-Key recommended
     GET    /api/visual-engine/videos/<id>/package     the files for Claude + "copy_all"
     GET    /api/visual-engine/videos/<id>/package.zip
+    GET    /api/visual-engine/videos/<id>/timeline       every element of the finished video (timeline page)
+    GET    /api/visual-engine/videos/<id>/thumb?asset=|scene=   small JPEG preview
+    POST   /api/visual-engine/videos/<id>/edits          {edits: [{type: set|swap, …}]} → re-render those scenes
     POST   /api/visual-engine/videos/<id>/plan        {"plan": "<Claude's JSON>"} → video.plan {ok, blocking, warnings}
     POST   /api/visual-engine/videos/<id>/render
     GET    /api/visual-engine/videos                  my videos (newest first; ?status=queued,running&before=<id>)
@@ -151,7 +154,9 @@ def view(doc: dict, *, admin: bool = False) -> dict:
     req.pop("script", None)
     out["request"] = req
     res = dict(out.get("result") or {})
-    for k in ("internal_job_id", "video_path", "credits"):
+    if res:
+        res["has_timeline"] = bool(res.get("project_path"))  # this video can be opened and edited on a timeline
+    for k in ("internal_job_id", "video_path", "credits", "project_path"):
         res.pop(k, None)
     if doc.get("status") == "completed" and res.get("video_file"):
         res["download_url"] = f"/api/visual-engine/videos/{doc['_id']}/download"
@@ -444,6 +449,35 @@ def post_plan(email, role, job_id):
 @_engine
 def post_render(email, role, job_id):
     get_client().call("POST", f"/v1/videos/{job_id}/render", user=email, role=role)
+    return jsonify({"video": view(_db()[JOBS].find_one({"_id": job_id}), admin=role == "admin")})
+
+
+@visual_engine_bp.route("/videos/<job_id>/timeline", methods=["GET"])
+@logged_in
+@_engine
+def get_timeline(email, role, job_id):
+    return jsonify(get_client().call("GET", f"/v1/videos/{job_id}/timeline", user=email, role=role,
+                                     timeout=(5, 60)))
+
+
+@visual_engine_bp.route("/videos/<job_id>/thumb", methods=["GET"])
+@logged_in
+@_engine
+def get_thumb(email, role, job_id):
+    params = {k: request.args[k] for k in ("asset", "scene") if request.args.get(k)}
+    up = get_client().call("GET", f"/v1/videos/{job_id}/thumb", user=email, role=role, params=params, stream=True,
+                           timeout=(5, 60))
+    return Response(b"".join(up.iter_content(65536)), mimetype="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@visual_engine_bp.route("/videos/<job_id>/edits", methods=["POST"])
+@logged_in
+@_engine
+def post_edits(email, role, job_id):
+    data = request.get_json(silent=True) or {}
+    get_client().call("POST", f"/v1/videos/{job_id}/edits", user=email, role=role,
+                      json={"edits": data.get("edits")}, timeout=(5, 60))
     return jsonify({"video": view(_db()[JOBS].find_one({"_id": job_id}), admin=role == "admin")})
 
 
