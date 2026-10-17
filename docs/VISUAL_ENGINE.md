@@ -49,9 +49,10 @@ Admins may also send `"dry_run": true` with a video request: a 6-second test vid
 
 ## Also changed in this branch
 
-- `/api/register` no longer takes `status` from the request — anyone could sign up as `admin`. New accounts are
-  always `user`; make admins in the database. **Check for existing self-made admins:**
-  `db.users.find({status: "admin"}, {email: 1})`.
+- `/api/register` now needs a logged-in user (the Sign-up page is already behind login), and only an admin can
+  create another admin. Before, anyone on the internet could POST `"status": "admin"` without logging in.
+  The Sign-up page must send the login token (frontend change in the same work). **Check for existing self-made
+  admins:** `db.users.find({status: "admin"}, {email: 1})`.
 - `DELETE /api/completed-videos/cleanup` now needs an admin (it was open to anyone).
 
 ## Tests

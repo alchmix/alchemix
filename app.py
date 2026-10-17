@@ -471,14 +471,18 @@ def get_news():
 
 
 @app.route('/api/register', methods=['POST'])
+@jwt_required()  # accounts are created from the Sign-up page by a logged-in team member, never anonymously
 def register():
     email = request.json.get('email', None)
     firstName = request.json.get('firstName', None)
     lastName=request.json.get('lastName',None)
     password = request.json.get('password', None)
-    # Never take the role from the request: anyone could sign up as "admin". New accounts are always "user";
-    # make an admin by setting users.status = "admin" in the database.
-    status = "user"
+    status = (request.json.get('status') or 'user').strip().lower()
+    if status not in ('user', 'admin'):
+        return jsonify({"error": "Status must be user or admin"}), 400
+    # Only an admin may create another admin (before this, anyone could POST status "admin" without logging in).
+    if status == 'admin' and not _is_admin():
+        return jsonify({"error": "Only an admin can create an administrator account"}), 403
 
     if not email or not password or not firstName or not lastName:
         return jsonify({"error": "Email, name and password are required"}), 400
