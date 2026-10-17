@@ -69,7 +69,7 @@ CALLBACK_MAX_SKEW_SEC = 300
 _PUBLIC = ("user_id", "title", "status", "stage", "progress", "priority", "attempts", "created_at", "queued_at",
            "started_at", "finished_at", "updated_at", "error", "result", "cancel_requested", "request",
            "manual_retries", "phase", "package", "plan", "renders")
-BRAND_FIELDS = ("voice", "look", "genre", "accent", "notes", "visual_mode")
+BRAND_FIELDS = ("voice", "look", "genre", "accent", "notes", "visual_mode", "voice_name")
 
 
 def _db():
@@ -233,9 +233,49 @@ def _my_channels(email: str, role: str, channel_id: str | None = None):
     return list(_db().channels.find(q).sort("createdAt", -1))
 
 
+_CARTESIA: dict[str, str] | None = None
+
+
+def _cartesia_voices() -> dict[str, str]:
+    """The Cartesia voice names → ids the main pipeline knows (helper/cartesia.py). Read once; if importing that
+    module fails (it needs audio libraries), the dict is read straight from the file."""
+    global _CARTESIA
+    if _CARTESIA is None:
+        try:
+            from helper.cartesia import CARTESIA_VOICES
+
+            _CARTESIA = dict(CARTESIA_VOICES)
+        except Exception:
+            import re
+            from pathlib import Path
+
+            _CARTESIA = {}
+            try:
+                src = (Path(__file__).parent / "helper" / "cartesia.py").read_text(encoding="utf-8")
+                m = re.search(r"CARTESIA_VOICES\s*=\s*\{(.*?)\}", src, re.S)
+                if m:
+                    _CARTESIA = dict(re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', m.group(1)))
+            except Exception:
+                pass
+    return _CARTESIA
+
+
+def _channel_voice(ch: dict) -> dict | None:
+    """The voice the channel already uses everywhere (set on the Voices page). Documentaries need Speechify
+    (it gives the word timings), so a Cartesia voice is reported as such and the user picks a Speechify one."""
+    vid = (ch.get("voice") or ch.get("speechify_voice_id") or "").strip()
+    if not vid:
+        return None
+    cart = _cartesia_voices()
+    provider = "cartesia" if (vid in cart or vid in cart.values()) else "speechify"
+    return {"id": vid, "name": ch.get("speechify_voice_name") or None, "provider": provider}
+
+
 def _channel_view(ch: dict) -> dict:
     kit = ch.get("brandKit") or {}
-    return {"id": str(ch["_id"]), "name": ch.get("channelName"), "niche": ch.get("niche"), "logo": ch.get("logo"),
+    logo = ch.get("logo")
+    return {"id": str(ch["_id"]), "name": ch.get("channelName"), "niche": ch.get("niche"), "logo": logo,
+            "logo_url": f"/channel_media/{logo}" if logo else None, "voice": _channel_voice(ch),
             "brand_kit": {k: kit.get(k) for k in BRAND_FIELDS if kit.get(k)}}
 
 
@@ -285,7 +325,15 @@ def create_video(email, role):
         _db().channels.update_one({"_id": ch["_id"]}, {"$set": {"brandKit": _clean_kit(kit)}})
     body = {"title": data.get("title"), "script": data.get("script"), "channel_id": str(ch["_id"]),
             "channel_name": ch.get("channelName"), "niche": (str(ch.get("niche"))[:60] if ch.get("niche") else None)}
-    for src, dst in (("voice", "voice"), ("look", "look"), ("genre", "genre"), ("accent", "accent"),
+    if not kit.get("voice"):  # the channel's own voice, unless this video (or its brand kit) names another
+        cv = _channel_voice(ch)
+        if cv and cv["provider"] == "speechify":
+            kit["voice"] = cv["id"]
+            kit.setdefault("voice_name", cv.get("name") or "")
+        elif cv:
+            return _err("voice_not_supported", "This channel's voice is a Cartesia voice. Documentaries need a "
+                        "Speechify voice for the word timings: choose one for this channel.", 400)
+    for src, dst in (("voice", "voice"), ("voice_name", "voice_name"), ("look", "look"), ("genre", "genre"), ("accent", "accent"),
                      ("notes", "brand_notes"), ("visual_mode", "visual_mode")):
         if kit.get(src):
             body[dst] = kit[src]
