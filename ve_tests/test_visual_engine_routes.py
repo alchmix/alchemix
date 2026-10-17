@@ -152,6 +152,38 @@ def test_channel_is_required_and_brand_kit_can_be_saved(env):
                      headers=auth(env, "bo@x.com")).status_code == 404
 
 
+def test_the_channels_own_voice_is_used(env):
+    env.fake.answers[("POST", "/v1/videos")] = (202, lambda j: {"video": {"id": "ve_9"}, "created": True})
+    env.db.channels.update_one({"channelName": "Old Times"}, {"$set": {"brandKit": {"look": "editorial"},
+                                "voice": "henry", "speechify_voice_name": "Henry", "logo": "a_logo.png"}})
+    ch = env.c.get("/api/visual-engine/channels", headers=auth(env)).get_json()["channels"][0]
+    assert ch["voice"] == {"id": "henry", "name": "Henry", "provider": "speechify"}
+    assert ch["logo_url"] == "/channel_media/a_logo.png"
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel},
+               headers=auth(env))
+    assert env.fake.calls[-1].json["voice"] == "henry" and env.fake.calls[-1].json["voice_name"] == "Henry"
+    # a voice chosen for this video wins over the channel's
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel,
+                                                  "voice": "liam", "voice_name": "Liam"}, headers=auth(env))
+    assert env.fake.calls[-1].json["voice"] == "liam"
+
+
+def test_a_cartesia_channel_voice_asks_for_a_speechify_one(env, monkeypatch):
+    import types
+    import sys
+
+    monkeypatch.setitem(sys.modules, "helper.cartesia",
+                        types.SimpleNamespace(CARTESIA_VOICES={"carson": "86e30c1d-714b-4074-a1f2-1cb6b552fb49"}))
+    monkeypatch.setattr(VR, "_CARTESIA", None)
+    env.db.channels.update_one({"channelName": "Old Times"}, {"$set": {"brandKit": {},
+                                "voice": "86e30c1d-714b-4074-a1f2-1cb6b552fb49"}})
+    ch = env.c.get("/api/visual-engine/channels", headers=auth(env)).get_json()["channels"][0]
+    assert ch["voice"]["provider"] == "cartesia"
+    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel},
+                   headers=auth(env))
+    assert r.status_code == 400 and r.get_json()["error"]["code"] == "voice_not_supported"
+
+
 def test_someone_elses_channel_is_refused(env):
     r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel},
                    headers=auth(env, "bo@x.com"))
@@ -299,3 +331,11 @@ def test_timings_ready_callback_notifies(env, monkeypatch):
                                                                       "title": "T", "status": "awaiting_plan"}}
     assert _signed(env, ev).status_code == 200
     assert sent == ["video.timings_ready"] and env.db.completed_videos.count_documents({}) == 0
+
+
+def test_cartesia_ids_are_read_from_the_file_when_the_module_cannot_load(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "helper.cartesia", None)  # importing it now raises ImportError
+    monkeypatch.setattr(VR, "_CARTESIA", None)
+    assert VR._cartesia_voices().get("carson") == "86e30c1d-714b-4074-a1f2-1cb6b552fb49"

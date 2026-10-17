@@ -26,9 +26,9 @@ Manual flow: script + channel → voice & timings → copy the package to Claude
 | method | path | notes |
 |---|---|---|
 | GET | `/api/visual-engine/options` | voices, looks, genres, visual modes, limits → build the form from this |
-| GET | `/api/visual-engine/channels` | my channels with their saved brand kit (`brand_kit`: voice, look, genre, accent, notes, visual_mode) |
+| GET | `/api/visual-engine/channels` | my channels: `voice` (the channel's own voice: `{id, name, provider}`; documentaries need `provider: speechify`), `logo_url`, saved `brand_kit` (look, accent, genre, visual_mode, notes, and `voice`/`voice_name` when documentaries use a different voice than the channel) |
 | PUT | `/api/visual-engine/channels/<id>/brand-kit` | save a channel's brand kit |
-| POST | `/api/visual-engine/videos` | `{title, script, channel_id, voice?, look?, genre?, visual_mode?, accent?, brand_notes?, save_brand_kit?}` — `channel_id` required; missing fields come from the channel's brand kit. Send an `Idempotency-Key` header so a double click never makes two videos. 202 → `{video}` |
+| POST | `/api/visual-engine/videos` | `{title, script, channel_id, voice?, voice_name?, look?, genre?, visual_mode?, accent?, brand_notes?, save_brand_kit?}` — `channel_id` required; missing fields come from the channel's brand kit, the voice from the brand kit or else the channel's own voice (400 `voice_not_supported` if that is a Cartesia voice). Send an `Idempotency-Key` header so a double click never makes two videos. 202 → `{video}` |
 | GET | `/api/visual-engine/videos` | my videos, newest first. `?status=…`, `?before=<id>` for the next page |
 | GET | `/api/visual-engine/videos/<id>` | poll every 4–10 s while `status` is `queued`/`running`. `step` tells the page what to show: `voice`, `plan`, `rendering`, `done`, `voice_failed`, `render_failed`, `canceled` |
 | GET | `/api/visual-engine/videos/<id>/package` | `{files: [{name, title, content}], copy_all}` — what the user gives Claude (timings + rulebook always together) |
