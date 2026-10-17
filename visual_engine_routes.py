@@ -69,7 +69,8 @@ CALLBACK_MAX_SKEW_SEC = 300
 _PUBLIC = ("user_id", "title", "status", "stage", "progress", "priority", "attempts", "created_at", "queued_at",
            "started_at", "finished_at", "updated_at", "error", "result", "cancel_requested", "request",
            "manual_retries", "phase", "package", "plan", "renders")
-BRAND_FIELDS = ("voice", "look", "genre", "accent", "notes", "visual_mode", "voice_name")
+BRAND_FIELDS = ("voice", "look", "genre", "accent", "notes", "visual_mode", "voice_name", "motion")
+MOTION_AXES = ("tempo", "reveal", "entrance", "highlight", "treatment", "surface")
 
 
 def _db():
@@ -285,11 +286,29 @@ def my_channels(email, role):
     return jsonify({"channels": [_channel_view(c) for c in _my_channels(email, "user")]})
 
 
+def _clean_motion(v) -> dict:
+    """{axis: [option, …]} — the engine checks the option names; here only the shape and size are kept sane."""
+    out = {}
+    if isinstance(v, dict):
+        for ax in MOTION_AXES:
+            vals = v.get(ax)
+            vals = [vals] if isinstance(vals, str) else vals
+            if isinstance(vals, list):
+                vals = [x.strip().lower()[:20] for x in vals if isinstance(x, str) and x.strip()][:10]
+                if vals:
+                    out[ax] = vals
+    return out
+
+
 def _clean_kit(data: dict) -> dict:
     kit = {}
     for k in BRAND_FIELDS:
         v = data.get(k)
-        if isinstance(v, str) and v.strip():
+        if k == "motion":
+            m = _clean_motion(v)
+            if m:
+                kit[k] = m
+        elif isinstance(v, str) and v.strip():
             kit[k] = v.strip()[:1000 if k == "notes" else 40]
     return kit
 
@@ -333,7 +352,7 @@ def create_video(email, role):
         elif cv:
             return _err("voice_not_supported", "This channel's voice is a Cartesia voice. Documentaries need a "
                         "Speechify voice for the word timings: choose one for this channel.", 400)
-    for src, dst in (("voice", "voice"), ("voice_name", "voice_name"), ("look", "look"), ("genre", "genre"), ("accent", "accent"),
+    for src, dst in (("motion", "motion"), ("voice", "voice"), ("voice_name", "voice_name"), ("look", "look"), ("genre", "genre"), ("accent", "accent"),
                      ("notes", "brand_notes"), ("visual_mode", "visual_mode")):
         if kit.get(src):
             body[dst] = kit[src]

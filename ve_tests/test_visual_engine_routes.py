@@ -339,3 +339,14 @@ def test_cartesia_ids_are_read_from_the_file_when_the_module_cannot_load(monkeyp
     monkeypatch.setitem(sys.modules, "helper.cartesia", None)  # importing it now raises ImportError
     monkeypatch.setattr(VR, "_CARTESIA", None)
     assert VR._cartesia_voices().get("carson") == "86e30c1d-714b-4074-a1f2-1cb6b552fb49"
+
+
+def test_brand_kit_motion_is_saved_and_sent(env):
+    env.fake.answers[("POST", "/v1/videos")] = (202, lambda j: {"video": {"id": "ve_9"}, "created": True})
+    r = env.c.put(f"/api/visual-engine/channels/{env.channel}/brand-kit",
+                  json={"look": "newsroom", "motion": {"reveal": ["type", "decode"], "tempo": "brisk", "x": ["y"]}},
+                  headers=auth(env))
+    assert r.get_json()["channel"]["brand_kit"]["motion"] == {"tempo": ["brisk"], "reveal": ["type", "decode"]}
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel,
+                                                  "voice": "liam"}, headers=auth(env))
+    assert env.fake.calls[-1].json["motion"] == {"tempo": ["brisk"], "reveal": ["type", "decode"]}
