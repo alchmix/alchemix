@@ -38,6 +38,9 @@ Manual flow: script + channel → voice & timings → copy the package to Claude
 | POST | `/api/visual-engine/videos/<id>/cancel` | queued: at once; running: within seconds |
 | POST | `/api/visual-engine/videos/<id>/retry` | failed/canceled only, limited per video |
 | GET | `/api/visual-engine/videos/<id>/download` | the MP4 as a download |
+| GET | `/api/visual-engine/videos/<id>/timeline` | every element of a finished video (scenes, footage/photos with source and licence, text, graphics with editable fields, narration words, sound effects). Only when `result.has_timeline` |
+| GET | `/api/visual-engine/videos/<id>/thumb?asset=<id>` or `?scene=<id>` | small JPEG preview (fetch with the login token) |
+| POST | `/api/visual-engine/videos/<id>/edits` | `{edits: [{type: "set", scene_id, composition, layer_id, path, value} \| {type: "swap", scene_id, composition, layer_id, url, pick?, clip?}]}` → only those scenes re-render; the video comes back as the next version (counts as a render) |
 
 Telegram: "⏱ Timings ready" when the package is ready, then the usual done/failed messages.
 
