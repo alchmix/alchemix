@@ -56,7 +56,10 @@ def env(monkeypatch, tmp_path):
     ana = db.users.insert_one({"email": "ana@x.com", "status": "user"}).inserted_id
     db.users.insert_one({"email": "bo@x.com", "status": "user"})
     db.users.insert_one({"email": "boss@x.com", "status": "admin"})
-    ch = db.channels.insert_one({"userId": str(ana), "channelName": "Old Times", "niche": "history"}).inserted_id
+    ch = db.channels.insert_one({"userId": str(ana), "channelName": "Old Times", "niche": "history",
+                                 "brandKit": {"voice": "nora", "look": "editorial", "accent": "#E2B36E"}}).inserted_id
+    boss = db.users.find_one({"email": "boss@x.com"})["_id"]
+    bch = db.channels.insert_one({"userId": str(boss), "channelName": "Boss TV", "niche": "news"}).inserted_id
     fake = FakeEngine()
     VC.set_client(VC.EngineClient("http://127.0.0.1:5001", session=fake))
     VR._catalog_cache.update(at=0.0, data=None)
@@ -67,7 +70,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(VR, "OUTPUT_FOLDER", str(tmp_path))
     with app.app_context():
         tok = {e: create_access_token(identity=e) for e in ("ana@x.com", "bo@x.com", "boss@x.com", "ghost@x.com")}
-    yield SimpleNamespace(app=app, c=app.test_client(), db=db, fake=fake, tok=tok, channel=str(ch), out=tmp_path)
+    yield SimpleNamespace(app=app, c=app.test_client(), db=db, fake=fake, tok=tok, channel=str(ch), out=tmp_path,
+                          boss_channel=str(bch))
     VC.set_client(None)
 
 
@@ -94,8 +98,8 @@ def test_needs_login(env):
 
 def test_service_token_role_comes_from_the_database(env):
     env.fake.answers[("POST", "/v1/videos")] = (202, lambda j: {"video": {"id": "ve_9"}, "created": True})
-    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "priority": 9, "dry_run": True},
-               headers=auth(env))
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "priority": 9, "dry_run": True,
+                                                  "channel_id": env.channel}, headers=auth(env))
     call = env.fake.calls[-1]
     import jwt
 
@@ -103,11 +107,11 @@ def test_service_token_role_comes_from_the_database(env):
                         audience="visual-engine")
     assert claims["sub"] == "ana@x.com" and claims["role"] == "user" and claims["exp"] - claims["iat"] <= 120
     assert "priority" not in call.json and "dry_run" not in call.json  # users can't sneak admin fields through
-    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "priority": 9},
-               headers=auth(env, "boss@x.com"))
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "dry_run": True,
+                                                  "channel_id": env.boss_channel}, headers=auth(env, "boss@x.com"))
     claims = jwt.decode(env.fake.calls[-1].headers["Authorization"].split()[1], SECRET, algorithms=["HS256"],
                         audience="visual-engine")
-    assert claims["role"] == "admin" and env.fake.calls[-1].json["priority"] == 9
+    assert claims["role"] == "admin" and env.fake.calls[-1].json["dry_run"] is True
 
 
 def test_admin_routes_are_admin_only(env):
@@ -118,15 +122,34 @@ def test_admin_routes_are_admin_only(env):
 # ── creating ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def test_create_forwards_only_allowed_fields_and_channel_niche(env):
+def test_create_uses_the_channel_brand_kit_with_overrides(env):
     env.fake.answers[("POST", "/v1/videos")] = (202, lambda j: {"video": {"id": "ve_9"}, "created": True})
     r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel,
-                                                      "status": "admin", "user_id": "bo@x.com"},
+                                                      "genre": "history", "status": "admin", "user_id": "bo@x.com"},
                    headers={**auth(env), "Idempotency-Key": "abc-123-xyz"})
     assert r.status_code == 202
     call = env.fake.calls[-1]
-    assert call.json == {"title": "T", "script": "s", "channel_id": env.channel, "niche": "history"}
+    assert call.json == {"title": "T", "script": "s", "channel_id": env.channel, "channel_name": "Old Times",
+                         "niche": "history", "voice": "nora", "look": "editorial", "accent": "#E2B36E",
+                         "genre": "history"}
     assert call.headers["Idempotency-Key"] == "abc-123-xyz"
+    assert env.db.channels.find_one({"channelName": "Old Times"})["brandKit"].get("genre") is None  # not saved
+
+
+def test_channel_is_required_and_brand_kit_can_be_saved(env):
+    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s"}, headers=auth(env))
+    assert r.status_code == 400 and r.get_json()["error"]["code"] == "channel_required"
+    env.fake.answers[("POST", "/v1/videos")] = (202, lambda j: {"video": {"id": "ve_9"}, "created": True})
+    env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel,
+                                                  "look": "tech", "save_brand_kit": True}, headers=auth(env))
+    assert env.db.channels.find_one({"channelName": "Old Times"})["brandKit"]["look"] == "tech"
+    chans = env.c.get("/api/visual-engine/channels", headers=auth(env)).get_json()["channels"]
+    assert [c["name"] for c in chans] == ["Old Times"] and chans[0]["brand_kit"]["voice"] == "nora"
+    r = env.c.put(f"/api/visual-engine/channels/{env.channel}/brand-kit", json={"voice": "liam", "bogus": "x"},
+                  headers=auth(env))
+    assert r.get_json()["channel"]["brand_kit"] == {"voice": "liam"}
+    assert env.c.put(f"/api/visual-engine/channels/{env.channel}/brand-kit", json={},
+                     headers=auth(env, "bo@x.com")).status_code == 404
 
 
 def test_someone_elses_channel_is_refused(env):
@@ -141,7 +164,8 @@ def test_someone_elses_channel_is_refused(env):
 def test_engine_errors_pass_through(env):
     env.fake.answers[("POST", "/v1/videos")] = (429, {"error": {"code": "daily_limit", "message": "Limit",
                                                                  "retry_after_sec": 3600}})
-    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s"}, headers=auth(env))
+    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel},
+                   headers=auth(env))
     assert r.status_code == 429 and r.get_json()["error"]["code"] == "daily_limit"
     assert r.headers["Retry-After"] == "3600"
 
@@ -154,7 +178,8 @@ def test_engine_down_is_a_clear_502(env):
             raise requests.ConnectionError("refused")
 
     VC.set_client(VC.EngineClient("http://127.0.0.1:5001", session=Down()))
-    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s"}, headers=auth(env))
+    r = env.c.post("/api/visual-engine/videos", json={"title": "T", "script": "s", "channel_id": env.channel},
+                   headers=auth(env))
     assert r.status_code == 502 and r.get_json()["error"]["code"] == "engine_unavailable"
 
 
@@ -238,3 +263,39 @@ def test_callback_rejects_bad_signatures_and_replays(env, kw):
 def test_callback_without_signature(env):
     r = env.c.post("/api/visual-engine/callback", json=_completed_event())
     assert r.status_code == 401
+
+
+# ── the manual flow: package → plan → render ────────────────────────────────────────────────────────────────────
+
+
+def test_package_plan_and_render_are_forwarded(env):
+    _job(env, "ve_7", status="awaiting_plan", phase="voice", package={"beats": 3, "files": []})
+    env.fake.answers[("GET", "/v1/videos/ve_7/package")] = (200, {"files": [{"name": "x"}], "copy_all": "all"})
+    r = env.c.get("/api/visual-engine/videos/ve_7/package", headers=auth(env))
+    assert r.get_json()["copy_all"] == "all"
+    v = env.c.get("/api/visual-engine/videos/ve_7", headers=auth(env)).get_json()["video"]
+    assert v["step"] == "plan" and v["package"]["beats"] == 3
+    env.fake.answers[("POST", "/v1/videos/ve_7/plan")] = (200, {"video": {"id": "ve_7"}})
+    env.c.post("/api/visual-engine/videos/ve_7/plan", json={"plan": "{\"beats\": []}"}, headers=auth(env))
+    assert env.fake.calls[-1].json == {"plan": "{\"beats\": []}"}
+    env.fake.answers[("POST", "/v1/videos/ve_7/render")] = (409, {"error": {"code": "plan_not_ready",
+                                                                           "message": "Paste first"}})
+    r = env.c.post("/api/visual-engine/videos/ve_7/render", headers=auth(env))
+    assert r.status_code == 409 and r.get_json()["error"]["code"] == "plan_not_ready"
+
+
+def test_steps(env):
+    assert VR.step_of({"status": "running", "phase": "voice"}) == "voice"
+    assert VR.step_of({"status": "awaiting_plan", "phase": "voice"}) == "plan"
+    assert VR.step_of({"status": "running", "phase": "render"}) == "rendering"
+    assert VR.step_of({"status": "completed", "phase": "render"}) == "done"
+    assert VR.step_of({"status": "canceled", "phase": "render"}) == "plan"
+
+
+def test_timings_ready_callback_notifies(env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(VR, "_notify", lambda kind, job: sent.append(kind))
+    ev = {"event_id": "evt_t", "type": "video.timings_ready", "job": {"id": "ve_8", "user_id": "ana@x.com",
+                                                                      "title": "T", "status": "awaiting_plan"}}
+    assert _signed(env, ev).status_code == 200
+    assert sent == ["video.timings_ready"] and env.db.completed_videos.count_documents({}) == 0

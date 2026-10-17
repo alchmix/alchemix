@@ -20,21 +20,33 @@ VE_OUTPUT_FOLDER=outputs          # where the engine copies finished videos (its
 All need the normal login token (`Authorization: Bearer <token>`). Errors are always
 `{"error": {"code": "...", "message": "..."}}` — show `message`, branch on `code`.
 
+The frontend pages are **Documentaries** (`/documentaries`, `/documentaries/new`, `/documentaries/<id>`).
+Manual flow: script + channel → voice & timings → copy the package to Claude → paste Claude's JSON plan → render.
+
 | method | path | notes |
 |---|---|---|
 | GET | `/api/visual-engine/options` | voices, looks, genres, visual modes, limits → build the form from this |
-| POST | `/api/visual-engine/videos` | `{title, script, voice?, visual_mode?: "footage"\|"mograph", look?, genre?, channel_id?}`; send an `Idempotency-Key` header (e.g. a UUID made when the form opens) so a double click never makes two videos. 202 → `{video}` |
-| GET | `/api/visual-engine/videos` | my videos, newest first. `?status=queued,running`, `?before=<id>` for the next page |
-| GET | `/api/visual-engine/videos/<id>` | poll every 5–10 s while `status` is `queued`/`running`: `stage`, `progress` (0–1), `queue_position` |
-| POST | `/api/visual-engine/videos/<id>/cancel` | queued: at once; rendering: within seconds |
+| GET | `/api/visual-engine/channels` | my channels with their saved brand kit (`brand_kit`: voice, look, genre, accent, notes, visual_mode) |
+| PUT | `/api/visual-engine/channels/<id>/brand-kit` | save a channel's brand kit |
+| POST | `/api/visual-engine/videos` | `{title, script, channel_id, voice?, look?, genre?, visual_mode?, accent?, brand_notes?, save_brand_kit?}` — `channel_id` required; missing fields come from the channel's brand kit. Send an `Idempotency-Key` header so a double click never makes two videos. 202 → `{video}` |
+| GET | `/api/visual-engine/videos` | my videos, newest first. `?status=…`, `?before=<id>` for the next page |
+| GET | `/api/visual-engine/videos/<id>` | poll every 4–10 s while `status` is `queued`/`running`. `step` tells the page what to show: `voice`, `plan`, `rendering`, `done`, `voice_failed`, `render_failed`, `canceled` |
+| GET | `/api/visual-engine/videos/<id>/package` | `{files: [{name, title, content}], copy_all}` — what the user gives Claude (timings + rulebook always together) |
+| GET | `/api/visual-engine/videos/<id>/package.zip` | the same as a zip |
+| POST | `/api/visual-engine/videos/<id>/plan` | `{plan: "<pasted text>"}` → `{video}` with `plan: {version, ok, blocking[], warnings[], info[], scenes}` |
+| POST | `/api/visual-engine/videos/<id>/render` | only when `plan.ok`; also "render again" after done |
+| POST | `/api/visual-engine/videos/<id>/cancel` | queued: at once; running: within seconds |
 | POST | `/api/visual-engine/videos/<id>/retry` | failed/canceled only, limited per video |
 | GET | `/api/visual-engine/videos/<id>/download` | the MP4 as a download |
+
+Telegram: "⏱ Timings ready" when the package is ready, then the usual done/failed messages.
 
 A finished video also has `result.video_url` (`/videos/ve_….mp4`, for the player) and `result.thumbnail_url`.
 
 Error codes worth a specific message: `too_many_active`, `hourly_limit`, `daily_limit` (429, with `Retry-After`),
 `script_too_short`, `script_too_long`, `unknown_voice`, `unknown_channel`, `queue_full` (503),
-`engine_unavailable` (502: the engine is not running), `retry_limit`, `not_cancelable`.
+`engine_unavailable` (502: the engine is not running), `retry_limit`, `not_cancelable`, `channel_required`,
+`plan_not_ready`, `render_not_allowed`, `render_limit`, `plan_not_allowed`, `package_missing`.
 
 Video `status`: `queued` → `running` → `completed` | `failed` | `canceled`. Failed videos carry
 `error.code` + a plain `error.message` (raw details are admin-only).

@@ -3,10 +3,23 @@ Visual Engine — the AlchemyMix side. Logged-in users ask for documentary video
 are, forwards the request to the engine (signed), and turns the engine's callbacks into completed_videos records
 and Telegram notices.
 
+    The flow (manual — Claude writes the plan):
+      1. POST videos        script + channel  → the engine makes the voice and timings (Telegram: "timings ready")
+      2. GET  package       copy the timings, rulebook, instructions … into Claude
+      3. POST plan          paste Claude's JSON → checked at once (blocking problems / warnings)
+      4. POST render        render the plan → video (re-render with an improved plan any time, within limits)
+
     GET    /api/visual-engine/options                 voices, looks, genres, modes, limits (for the form)
-    POST   /api/visual-engine/videos                  request a video
-           {"title", "script", "voice"?, "visual_mode"?: "footage"|"mograph", "look"?, "genre"?, "channel_id"?}
-           header Idempotency-Key (optional): resubmitting the same key returns the same video
+    GET    /api/visual-engine/channels                my channels with their brand kits
+    PUT    /api/visual-engine/channels/<id>/brand-kit {voice, look, genre, accent, notes, visual_mode}
+    POST   /api/visual-engine/videos                  start a project
+           {"title", "script", "channel_id", "voice"?, "look"?, "genre"?, "accent"?, "brand_notes"?,
+            "visual_mode"?: "footage"|"mograph", "save_brand_kit"?: true}
+           missing fields come from the channel's brand kit; header Idempotency-Key recommended
+    GET    /api/visual-engine/videos/<id>/package     the files for Claude + "copy_all"
+    GET    /api/visual-engine/videos/<id>/package.zip
+    POST   /api/visual-engine/videos/<id>/plan        {"plan": "<Claude's JSON>"} → video.plan {ok, blocking, warnings}
+    POST   /api/visual-engine/videos/<id>/render
     GET    /api/visual-engine/videos                  my videos (newest first; ?status=queued,running&before=<id>)
     GET    /api/visual-engine/videos/<id>             one video: status, stage, progress, queue position, links
     POST   /api/visual-engine/videos/<id>/cancel
@@ -55,7 +68,8 @@ OUTPUT_FOLDER = os.getenv("VE_OUTPUT_FOLDER", "outputs")  # where the engine pub
 CALLBACK_MAX_SKEW_SEC = 300
 _PUBLIC = ("user_id", "title", "status", "stage", "progress", "priority", "attempts", "created_at", "queued_at",
            "started_at", "finished_at", "updated_at", "error", "result", "cancel_requested", "request",
-           "manual_retries")
+           "manual_retries", "phase", "package", "plan", "renders")
+BRAND_FIELDS = ("voice", "look", "genre", "accent", "notes", "visual_mode")
 
 
 def _db():
@@ -147,6 +161,9 @@ def view(doc: dict, *, admin: bool = False) -> dict:
     out["result"] = res or None
     for k in ("created_at", "queued_at", "started_at", "finished_at", "updated_at"):
         out[k] = _iso(out.get(k))
+    if isinstance(out.get("plan"), dict):
+        out["plan"] = {**out["plan"], "saved_at": _iso(out["plan"].get("saved_at"))}
+    out["step"] = step_of(doc)
     if doc.get("status") == "queued":
         col = _db()[JOBS]
         pr = doc.get("priority", 0)
@@ -160,6 +177,17 @@ def view(doc: dict, *, admin: bool = False) -> dict:
     return out
 
 
+def step_of(doc: dict) -> str:
+    """voice → plan → rendering → done (or voice_failed / render_failed / canceled)."""
+    st, ph = doc.get("status"), doc.get("phase") or "voice"
+    if ph == "voice":
+        return {"queued": "voice", "running": "voice", "failed": "voice_failed",
+                "canceled": "canceled"}.get(st, "plan")
+    if st in ("queued", "running"):
+        return "rendering"
+    return {"completed": "done", "failed": "render_failed"}.get(st, "plan")
+
+
 FRIENDLY = {
     "voice_failed": "The voice could not be made. Check the script and the voice, then retry.",
     "render_failed": "The video could not be rendered. You can retry; if it fails again, contact support.",
@@ -167,6 +195,7 @@ FRIENDLY = {
     "timeout": "Rendering took too long and was stopped. Retry, or try a shorter script.",
     "engine_error": "Something went wrong on the render machine. Retry, or contact support.",
     "admin_failed": "This video was stopped by an admin.",
+    "plan_missing": "No checked plan was found. Paste Claude's plan again, then render.",
     "canceled": "Canceled.",
 }
 
@@ -193,7 +222,47 @@ def options(email, role):
     return jsonify(_catalog_cache["data"])
 
 
-_ALLOWED = ("title", "script", "voice", "visual_mode", "look", "genre", "channel_id")
+def _my_channels(email: str, role: str, channel_id: str | None = None):
+    user = _db().users.find_one({"email": email}, {"_id": 1})
+    q: dict[str, Any] = {} if (role == "admin" and channel_id) else {"userId": str(user["_id"])}
+    if channel_id:
+        try:
+            q["_id"] = ObjectId(str(channel_id))
+        except Exception:
+            return []
+    return list(_db().channels.find(q).sort("createdAt", -1))
+
+
+def _channel_view(ch: dict) -> dict:
+    kit = ch.get("brandKit") or {}
+    return {"id": str(ch["_id"]), "name": ch.get("channelName"), "niche": ch.get("niche"), "logo": ch.get("logo"),
+            "brand_kit": {k: kit.get(k) for k in BRAND_FIELDS if kit.get(k)}}
+
+
+@visual_engine_bp.route("/channels", methods=["GET"])
+@logged_in
+def my_channels(email, role):
+    return jsonify({"channels": [_channel_view(c) for c in _my_channels(email, "user")]})
+
+
+def _clean_kit(data: dict) -> dict:
+    kit = {}
+    for k in BRAND_FIELDS:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            kit[k] = v.strip()[:1000 if k == "notes" else 40]
+    return kit
+
+
+@visual_engine_bp.route("/channels/<channel_id>/brand-kit", methods=["PUT"])
+@logged_in
+def save_brand_kit(email, role, channel_id):
+    chans = _my_channels(email, role, channel_id)
+    if not chans:
+        return _err("unknown_channel", "That channel was not found in your account.", 404)
+    kit = _clean_kit(request.get_json(silent=True) or {})
+    _db().channels.update_one({"_id": chans[0]["_id"]}, {"$set": {"brandKit": kit}})
+    return jsonify({"channel": _channel_view({**chans[0], "brandKit": kit})})
 
 
 @visual_engine_bp.route("/videos", methods=["POST"])
@@ -203,28 +272,31 @@ def create_video(email, role):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return _err("invalid_json", "Send the request as JSON.", 400)
-    body = {k: data[k] for k in _ALLOWED if data.get(k) not in (None, "")}
-    if role == "admin":
-        for k in ("priority", "dry_run"):
-            if k in data:
-                body[k] = data[k]
-    if body.get("channel_id"):  # the channel must be the user's own; its niche goes along as a hint
-        user = _db().users.find_one({"email": email}, {"_id": 1})
-        try:
-            ch = _db().channels.find_one({"_id": ObjectId(str(body["channel_id"]))})
-        except Exception:
-            ch = None
-        if not ch or (role != "admin" and str(ch.get("userId")) != str(user["_id"])):
-            return _err("unknown_channel", "That channel was not found in your account.", 404)
-        body["channel_id"] = str(ch["_id"])
-        if ch.get("niche"):
-            body["niche"] = str(ch["niche"])[:60]
+    if not data.get("channel_id"):
+        return _err("channel_required", "Choose the channel this video is for.", 400)
+    chans = _my_channels(email, role, data["channel_id"])
+    if not chans:
+        return _err("unknown_channel", "That channel was not found in your account.", 404)
+    ch = chans[0]
+    kit = {**(ch.get("brandKit") or {}), **_clean_kit({k: data.get(k) for k in BRAND_FIELDS}),
+           **({"notes": data["brand_notes"].strip()} if isinstance(data.get("brand_notes"), str)
+              and data["brand_notes"].strip() else {})}
+    if data.get("save_brand_kit"):
+        _db().channels.update_one({"_id": ch["_id"]}, {"$set": {"brandKit": _clean_kit(kit)}})
+    body = {"title": data.get("title"), "script": data.get("script"), "channel_id": str(ch["_id"]),
+            "channel_name": ch.get("channelName"), "niche": (str(ch.get("niche"))[:60] if ch.get("niche") else None)}
+    for src, dst in (("voice", "voice"), ("look", "look"), ("genre", "genre"), ("accent", "accent"),
+                     ("notes", "brand_notes"), ("visual_mode", "visual_mode")):
+        if kit.get(src):
+            body[dst] = kit[src]
+    body = {k: v for k, v in body.items() if v not in (None, "")}
+    if role == "admin" and data.get("dry_run"):
+        body["dry_run"] = True
     key = request.headers.get("Idempotency-Key") or data.get("client_request_id")
     res = get_client().create_video(email, role, body, idempotency_key=str(key) if key else None)
     status = 202 if res.get("created", True) else 200
-    return jsonify({"video": view(_db()[JOBS].find_one({"_id": res["video"]["id"]}) or {**res["video"],
-                                                                                       "_id": res["video"]["id"]},
-                                  admin=role == "admin"), "created": res.get("created", True)}), status
+    doc = _db()[JOBS].find_one({"_id": res["video"]["id"]}) or {**res["video"], "_id": res["video"]["id"]}
+    return jsonify({"video": view(doc, admin=role == "admin"), "created": res.get("created", True)}), status
 
 
 @visual_engine_bp.route("/videos", methods=["GET"])
@@ -270,6 +342,41 @@ def cancel_video(email, role, job_id):
 @_engine
 def retry_video(email, role, job_id):
     get_client().call("POST", f"/v1/videos/{job_id}/retry", user=email, role=role)
+    return jsonify({"video": view(_db()[JOBS].find_one({"_id": job_id}), admin=role == "admin")})
+
+
+@visual_engine_bp.route("/videos/<job_id>/package", methods=["GET"])
+@logged_in
+@_engine
+def get_package(email, role, job_id):
+    return jsonify(get_client().call("GET", f"/v1/videos/{job_id}/package", user=email, role=role))
+
+
+@visual_engine_bp.route("/videos/<job_id>/package.zip", methods=["GET"])
+@logged_in
+@_engine
+def get_package_zip(email, role, job_id):
+    up = get_client().call("GET", f"/v1/videos/{job_id}/package.zip", user=email, role=role, stream=True)
+    return Response(b"".join(up.iter_content(65536)), mimetype="application/zip",
+                    headers={"Content-Disposition": up.headers.get("Content-Disposition",
+                                                                   'attachment; filename="for Claude.zip"')})
+
+
+@visual_engine_bp.route("/videos/<job_id>/plan", methods=["POST"])
+@logged_in
+@_engine
+def post_plan(email, role, job_id):
+    data = request.get_json(silent=True) or {}
+    get_client().call("POST", f"/v1/videos/{job_id}/plan", user=email, role=role, json={"plan": data.get("plan")},
+                      timeout=(5, 120))
+    return jsonify({"video": view(_db()[JOBS].find_one({"_id": job_id}), admin=role == "admin")})
+
+
+@visual_engine_bp.route("/videos/<job_id>/render", methods=["POST"])
+@logged_in
+@_engine
+def post_render(email, role, job_id):
+    get_client().call("POST", f"/v1/videos/{job_id}/render", user=email, role=role)
     return jsonify({"video": view(_db()[JOBS].find_one({"_id": job_id}), admin=role == "admin")})
 
 
@@ -391,11 +498,13 @@ def _notify(kind: str, job: dict) -> None:
         from helper.telegram_notification_engine import send_telegram_error, send_telegram_notification
 
         user = job.get("user_id") or "?"
-        if kind == "video.completed":
-            front = os.getenv("FRONTEND_URL", "").rstrip("/")
-            send_telegram_notification(f"🎬 Documentary ready: {job.get('title')}", "View",
-                                       f"{front}/visual-engine/{job['id']}" if front else "https://alchemymix.com",
+        front = os.getenv("FRONTEND_URL", "").rstrip("/")
+        link = f"{front}/documentaries/{job['id']}" if front else "https://alchemymix.com"
+        if kind == "video.timings_ready":
+            send_telegram_notification(f"⏱ Timings ready: {job.get('title')} — copy them to Claude", "Open", link,
                                        user)
+        elif kind == "video.completed":
+            send_telegram_notification(f"🎬 Documentary ready: {job.get('title')}", "View", link, user)
         elif kind == "video.failed":
             err = job.get("error") or {}
             send_telegram_error(f"❌ Documentary failed: {job.get('title')} — {err.get('code')}: "
@@ -431,7 +540,7 @@ def engine_callback():
                           "duration_sec": res.get("duration_sec"), "niche": req.get("niche") or req.get("genre"),
                           "channel_id": req.get("channel_id"), "publish": res.get("publish"), "sections": []}},
                 upsert=True)
-        if kind in ("video.completed", "video.failed"):
+        if kind in ("video.completed", "video.failed", "video.timings_ready"):
             _notify(kind, job)
     except Exception as e:
         db[CALLBACK_LOG].delete_one({"_id": eid})  # let the engine's retry try again
